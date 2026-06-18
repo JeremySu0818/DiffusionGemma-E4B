@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffusiongemma-e4b"
+version = "0.1.0"
+description = "Gemma 4 E4B to DiffusionGemma-style block diffusion conversion pipeline"
+requires-python = ">=3.11"
+dependencies = [
+  "accelerate>=1.11.0",
+  "huggingface_hub>=0.36.0",
+  "numpy>=1.26",
+  "requests>=2.31",
+  "safetensors>=0.5",
+  "tokenizers>=0.21",
+  "torch>=2.12",
+  "tqdm>=4.66",
+  "transformers>=5.12.0",
+]
+
+[project.optional-dependencies]
+train = [
+  "peft>=0.14.0",
+  "bitsandbytes>=0.45.0; platform_system != 'Windows'",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,0 +1,5 @@
+{
+  "strict_infer_uses_generate_api": false,
+  "training_uses_diffusion_forward": true,
+  "strict_infer_declares_no_ar_fallback": true
+}

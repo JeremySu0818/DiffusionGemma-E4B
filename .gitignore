@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+outputs/logs/*.log
+artifacts/conversion_training/
+artifacts/transplanted/
+data/raw_self_continuation/self_continuation.jsonl
+data/raw_self_continuation/progress.json
+data/corruption/

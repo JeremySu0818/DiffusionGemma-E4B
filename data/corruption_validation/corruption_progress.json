@@ -1,0 +1,8 @@
+{
+  "blocks_written": 4,
+  "target_blocks": 4,
+  "total_blocks_available": 4,
+  "canvas_length": 256,
+  "prefix_length": 512,
+  "tokenizer": "google/gemma-4-E4B-it"
+}
