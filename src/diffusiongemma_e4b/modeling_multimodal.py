@@ -28,10 +28,10 @@ def _coerce_auto_config(config):
 
 
 class MultimodalDiffusionGemmaEncoderModel(DiffusionGemmaPreTrainedModel):
-    """DiffusionGemma encoder with Gemma4-compatible image, video, and audio input merging."""
+    """DiffusionGemma encoder with Gemma4-compatible image and audio input merging."""
 
     accepts_loss_kwargs = False
-    input_modalities = ("image", "text", "video", "audio")
+    input_modalities = ("image", "text", "audio")
 
     def __init__(self, config):
         super().__init__(config)
@@ -77,18 +77,6 @@ class MultimodalDiffusionGemmaEncoderModel(DiffusionGemmaPreTrainedModel):
         vision_outputs.pooler_output = self.embed_vision(inputs_embeds=vision_outputs.last_hidden_state)
         return vision_outputs
 
-    def get_video_features(
-        self,
-        pixel_values_videos: torch.FloatTensor,
-        video_position_ids: torch.LongTensor | None = None,
-        **kwargs,
-    ) -> BaseModelOutputWithPast:
-        if pixel_values_videos.ndim < 5:
-            raise ValueError("pixel_values_videos must include a frame dimension.")
-        flat_pixels = pixel_values_videos.flatten(0, 1)
-        flat_positions = video_position_ids.flatten(0, 1) if video_position_ids is not None else None
-        return self.get_image_features(flat_pixels, flat_positions, **kwargs)
-
     def get_audio_features(
         self,
         input_features: torch.Tensor,
@@ -105,21 +93,18 @@ class MultimodalDiffusionGemmaEncoderModel(DiffusionGemmaPreTrainedModel):
         self,
         input_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-    ) -> tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
+    ) -> tuple[torch.BoolTensor, torch.BoolTensor]:
         if input_ids is not None:
             image_mask = input_ids == self.config.image_token_id
-            video_mask = input_ids == getattr(self.config, "video_token_id", -1)
             audio_mask = input_ids == getattr(self.config, "audio_token_id", -1)
-            return image_mask, video_mask, audio_mask
+            return image_mask, audio_mask
 
         embed_tokens = self.get_input_embeddings()
         device = inputs_embeds.device
         image_embedding = embed_tokens(torch.tensor(self.config.image_token_id, dtype=torch.long, device=device))
-        video_embedding = embed_tokens(torch.tensor(getattr(self.config, "video_token_id", -1), dtype=torch.long, device=device))
         audio_embedding = embed_tokens(torch.tensor(getattr(self.config, "audio_token_id", -1), dtype=torch.long, device=device))
         return (
             (inputs_embeds == image_embedding).all(-1),
-            (inputs_embeds == video_embedding).all(-1),
             (inputs_embeds == audio_embedding).all(-1),
         )
 
@@ -147,7 +132,6 @@ class MultimodalDiffusionGemmaEncoderModel(DiffusionGemmaPreTrainedModel):
         self,
         input_ids: torch.LongTensor | None = None,
         pixel_values: torch.FloatTensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
         input_features: torch.FloatTensor | None = None,
         attention_mask: torch.Tensor | dict | None = None,
         input_features_mask: torch.Tensor | None = None,
@@ -156,14 +140,13 @@ class MultimodalDiffusionGemmaEncoderModel(DiffusionGemmaPreTrainedModel):
         mm_token_type_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         image_position_ids: torch.LongTensor | None = None,
-        video_position_ids: torch.LongTensor | None = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        image_mask, video_mask, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds)
-        multimodal_mask = image_mask | video_mask | audio_mask
+        image_mask, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds)
+        multimodal_mask = image_mask | audio_mask
 
         if inputs_embeds is None:
             llm_input_ids = input_ids.clone()
@@ -180,17 +163,6 @@ class MultimodalDiffusionGemmaEncoderModel(DiffusionGemmaPreTrainedModel):
                     f"features={tuple(image_features.shape)}"
                 )
             inputs_embeds = inputs_embeds.masked_scatter(expanded_mask, image_features)
-
-        if pixel_values_videos is not None:
-            video_features = self.get_video_features(pixel_values_videos, video_position_ids, **kwargs).pooler_output
-            video_features = video_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            expanded_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-            if inputs_embeds[expanded_mask].numel() != video_features.numel():
-                raise ValueError(
-                    f"Video features and video tokens do not match: tokens={int(video_mask.sum())}, "
-                    f"features={tuple(video_features.shape)}"
-                )
-            inputs_embeds = inputs_embeds.masked_scatter(expanded_mask, video_features)
 
         if input_features is not None or input_features_mask is not None:
             if input_features is None or input_features_mask is None:
@@ -271,11 +243,9 @@ class MultimodalDiffusionGemmaModel(DiffusionGemmaPreTrainedModel):
         decoder_attention_mask: torch.Tensor | dict | None = None,
         decoder_position_ids: torch.LongTensor | None = None,
         pixel_values: torch.FloatTensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
         input_features: torch.FloatTensor | None = None,
         input_features_mask: torch.Tensor | None = None,
         image_position_ids: torch.LongTensor | None = None,
-        video_position_ids: torch.LongTensor | None = None,
         mm_token_type_ids: torch.LongTensor | None = None,
         **kwargs,
     ) -> DiffusionGemmaModelOutputWithPast:
@@ -287,11 +257,9 @@ class MultimodalDiffusionGemmaModel(DiffusionGemmaPreTrainedModel):
                 past_key_values=past_key_values,
                 position_ids=position_ids,
                 pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
                 input_features=input_features,
                 input_features_mask=input_features_mask,
                 image_position_ids=image_position_ids,
-                video_position_ids=video_position_ids,
                 mm_token_type_ids=mm_token_type_ids,
                 **kwargs,
             )

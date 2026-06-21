@@ -151,8 +151,6 @@ def _chat_content(prompt: str, media: dict[str, Any]) -> str | list[dict[str, An
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for value in _as_list(media.get("image")) + _as_list(media.get("images")):
         content.append({"type": "image_url", "image_url": {"url": _media_url(value, prefer_data_url=True)}})
-    for value in _as_list(media.get("video")) + _as_list(media.get("videos")) + _as_list(media.get("media_path")):
-        content.append({"type": "video_url", "video_url": {"url": _media_url(value)}})
     for value in _as_list(media.get("audio")) + _as_list(media.get("audios")):
         content.append({"type": "audio_url", "audio_url": {"url": _media_url(value)}})
     return content

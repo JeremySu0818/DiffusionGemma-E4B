@@ -91,7 +91,6 @@ def build_diffusion_e4b_config(
         boi_token_id=getattr(base_cfg, "boi_token_id", 255999),
         eoi_token_id=getattr(base_cfg, "eoi_token_id", 258882),
         image_token_id=getattr(base_cfg, "image_token_id", 258880),
-        video_token_id=getattr(base_cfg, "video_token_id", 258884),
         boa_token_id=getattr(base_cfg, "boa_token_id", 256000),
         eoa_token_index=getattr(base_cfg, "eoa_token_index", 258883),
         audio_token_id=getattr(base_cfg, "audio_token_id", 258881),

@@ -15,11 +15,9 @@ from .data_contract import iter_jsonl
 
 MULTIMODAL_SHARD_KEYS = (
     "pixel_values",
-    "pixel_values_videos",
     "input_features",
     "input_features_mask",
     "image_position_ids",
-    "video_position_ids",
     "mm_token_type_ids",
 )
 
@@ -66,11 +64,6 @@ def _load_images(media: dict[str, Any]):
     from PIL import Image
 
     return [Image.open(path).convert("RGB") for path in image_paths]
-
-
-def _load_videos(media: dict[str, Any]):
-    videos = _media_values(media, "video", "videos", "media_path", "url")
-    return videos or None
 
 
 def _load_audio(media: dict[str, Any]) -> tuple[list[np.ndarray] | None, int | None]:
@@ -125,12 +118,9 @@ def _encoder_inputs(processor, tokenizer, record: dict[str, Any], prefix_length:
         "max_length": prefix_length,
     }
     images = _load_images(media)
-    videos = _load_videos(media)
     audio, sampling_rate = _load_audio(media)
     if images:
         kwargs["images"] = images[0] if len(images) == 1 else images
-    if videos:
-        kwargs["videos"] = videos[0] if len(videos) == 1 else videos
     if audio:
         kwargs["audio"] = audio[0] if len(audio) == 1 else audio
         kwargs["sampling_rate"] = sampling_rate
@@ -184,8 +174,6 @@ def _signature_name(signature: tuple[tuple[str, tuple[int, ...], str], ...]) -> 
     if not signature:
         return "text"
     keys = {item[0] for item in signature}
-    if "pixel_values_videos" in keys:
-        return "video"
     if "input_features" in keys:
         return "audio"
     if "pixel_values" in keys:
@@ -298,8 +286,6 @@ def verify_shards(output_dir: Path, min_blocks: int = 1, canvas_length: int = CA
                 raise ValueError(f"{path} corrupted/target shape mismatch")
             if "pixel_values" in shard and shard["prefix_ids"].shape[0] != shard["pixel_values"].shape[0]:
                 raise ValueError(f"{path} pixel_values row count mismatch")
-            if "pixel_values_videos" in shard and shard["prefix_ids"].shape[0] != shard["pixel_values_videos"].shape[0]:
-                raise ValueError(f"{path} pixel_values_videos row count mismatch")
             if "input_features" in shard and shard["prefix_ids"].shape[0] != shard["input_features"].shape[0]:
                 raise ValueError(f"{path} input_features row count mismatch")
             total += shard["target_ids"].shape[0]

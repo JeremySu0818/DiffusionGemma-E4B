@@ -7,7 +7,7 @@ from diffusiongemma_e4b.config import build_diffusion_e4b_config
 from diffusiongemma_e4b.train import CorruptionShardDataset, compute_loss
 
 
-def test_config_preserves_audio_video_fields(tmp_path):
+def test_config_preserves_audio_fields(tmp_path):
     cfg = build_diffusion_e4b_config("google/gemma-4-E4B-it")
     cfg.save_pretrained(tmp_path)
 
@@ -15,7 +15,6 @@ def test_config_preserves_audio_video_fields(tmp_path):
 
     assert getattr(loaded, "audio_config", None) is not None
     assert getattr(loaded, "audio_token_id", None) == 258881
-    assert getattr(loaded, "video_token_id", None) == 258884
     assert loaded.architectures == ["MultimodalDiffusionGemmaForBlockDiffusion"]
 
 
@@ -41,11 +40,9 @@ def test_compute_loss_passes_multimodal_kwargs_through_self_conditioning():
         "decoder_input_ids": torch.ones((1, 3), dtype=torch.long),
         "labels": torch.ones((1, 3), dtype=torch.long),
         "pixel_values": torch.ones((1, 3, 4, 4)),
-        "pixel_values_videos": torch.ones((1, 2, 3, 4, 4)),
         "input_features": torch.ones((1, 8, 4)),
         "input_features_mask": torch.ones((1, 8)),
         "image_position_ids": torch.zeros((1, 4, 2), dtype=torch.long),
-        "video_position_ids": torch.zeros((1, 2, 4, 2), dtype=torch.long),
         "mm_token_type_ids": torch.zeros((1, 4), dtype=torch.long),
     }
 
@@ -55,11 +52,9 @@ def test_compute_loss_passes_multimodal_kwargs_through_self_conditioning():
     assert len(model.calls) == 2
     for call in model.calls:
         assert "pixel_values" in call
-        assert "pixel_values_videos" in call
         assert "input_features" in call
         assert "input_features_mask" in call
         assert "image_position_ids" in call
-        assert "video_position_ids" in call
         assert "mm_token_type_ids" in call
 
 

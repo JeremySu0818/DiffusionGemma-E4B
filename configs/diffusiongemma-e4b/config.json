@@ -140,7 +140,6 @@
   },
   "tie_word_embeddings": true,
   "transformers_version": "5.12.1",
-  "video_token_id": 258884,
   "vision_config": {
     "_name_or_path": "",
     "architectures": null,

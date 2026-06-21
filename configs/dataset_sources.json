@@ -24,19 +24,9 @@
       "target": "Gemma4 teacher outputs from image QA, OCR, documents, charts, diagrams"
     },
     {
-      "bucket": "teacher_supervised_video",
-      "share": 0.1,
-      "target": "Gemma4 teacher outputs from sampled video/frame contexts"
-    },
-    {
       "bucket": "teacher_supervised_audio_speech",
-      "share": 0.08,
+      "share": 0.13,
       "target": "Gemma4 teacher outputs from speech/audio contexts"
-    },
-    {
-      "bucket": "teacher_supervised_audio_video",
-      "share": 0.05,
-      "target": "Gemma4 teacher outputs from synchronized audio-video contexts"
     },
     {
       "bucket": "eval_only",
@@ -206,34 +196,6 @@
       "license_hint": "science/diagram context"
     },
     {
-      "id": "lmms-lab/Video-MME",
-      "name": "video_mme_eval_context",
-      "role": "video_eval_context",
-      "modality": "video",
-      "split": "test",
-      "enabled": true,
-      "streaming": true,
-      "license_hint": "eval/prompt context"
-    },
-    {
-      "id": "OpenGVLab/InternVid",
-      "name": "internvid_video_context",
-      "role": "video_context",
-      "modality": "video",
-      "enabled": true,
-      "manifest_only": true,
-      "license_hint": "large external media; use manifest/raw media processor path"
-    },
-    {
-      "id": "webvid/webvid-10m",
-      "name": "webvid10m_video_context",
-      "role": "video_context",
-      "modality": "video",
-      "enabled": true,
-      "manifest_only": true,
-      "license_hint": "large external media; use manifest/raw media processor path"
-    },
-    {
       "id": "mozilla-foundation/common_voice_19_0",
       "name": "common_voice_speech",
       "role": "speech_audio_context",
@@ -258,7 +220,7 @@
       "modality": "audio",
       "enabled": true,
       "manifest_only": true,
-      "license_hint": "audio/video labels; use media manifest path"
+      "license_hint": "audio labels; use media manifest path"
     },
     {
       "id": "cvssp/audiocaps",
@@ -269,14 +231,6 @@
       "streaming": true,
       "license_hint": "audio caption context"
     },
-    {
-      "id": "Ego4D",
-      "name": "ego4d_audio_video",
-      "role": "audio_video_context",
-      "modality": "audio_video",
-      "enabled": true,
-      "manifest_only": true,
-      "license_hint": "external registration/download; use raw media processor path"
     }
   ],
   "avoid_as_primary_targets": [

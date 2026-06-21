@@ -160,7 +160,7 @@ def _collect_media(source: dict[str, Any], row: dict[str, Any], media_dir: Path 
         if paths:
             media["audio"] = paths
 
-    for key in ("video", "videos", "media_path", "url"):
+    for key in ("media_path", "url"):
         value = row.get(key)
         if isinstance(value, list):
             media[key] = [_jsonable(item) for item in value]

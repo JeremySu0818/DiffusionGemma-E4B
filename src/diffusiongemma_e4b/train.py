@@ -19,11 +19,9 @@ from .modeling_multimodal import MultimodalDiffusionGemmaForBlockDiffusion
 
 MULTIMODAL_BATCH_KEYS = (
     "pixel_values",
-    "pixel_values_videos",
     "input_features",
     "input_features_mask",
     "image_position_ids",
-    "video_position_ids",
     "mm_token_type_ids",
 )
 
@@ -89,7 +87,7 @@ class CorruptionShardDataset(Dataset):
             if key not in shard:
                 continue
             value = shard[key][row]
-            if key in {"pixel_values", "pixel_values_videos", "input_features"}:
+            if key in {"pixel_values", "input_features"}:
                 tensors[key] = torch.from_numpy(value.astype(np.float32))
             else:
                 tensors[key] = torch.from_numpy(value.astype(np.int64))
