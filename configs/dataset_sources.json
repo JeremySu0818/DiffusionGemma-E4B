@@ -1,0 +1,108 @@
+{
+  "objective": "DiffusionGemma-E4B conversion while maximizing Gemma 4 E4B behavior preservation",
+  "principle": "Use prompts and contexts to elicit Gemma 4 E4B teacher outputs. Do not use third-party assistant answers as primary training targets.",
+  "recommended_mix": [
+    {
+      "bucket": "teacher_behavior_stream",
+      "share": 0.7,
+      "target": "Gemma 4 E4B generated outputs from broad prompt/context banks"
+    },
+    {
+      "bucket": "denoising_warmup_stream",
+      "share": 0.2,
+      "target": "short optional warm-up on high-quality plain text"
+    },
+    {
+      "bucket": "prompt_free_self_continuation",
+      "share": 0.05,
+      "target": "repo-original prompt-free teacher generation path"
+    },
+    {
+      "bucket": "evaluation_only",
+      "share": 0.05,
+      "target": "student-vs-teacher behavior comparison prompts"
+    }
+  ],
+  "green_sources": [
+    {
+      "id": "lmsys/lmsys-chat-1m",
+      "role": "prompt_context_bank",
+      "use": "user turns and conversation context only",
+      "notes": "Requires accepting dataset terms on Hugging Face."
+    },
+    {
+      "id": "allenai/WildChat-4.8M",
+      "role": "prompt_context_bank",
+      "use": "non-toxic user inputs only",
+      "notes": "Large real-world user prompt coverage; privacy and dedupe filters required."
+    },
+    {
+      "id": "allenai/WildChat-nontoxic",
+      "role": "prompt_context_bank",
+      "use": "fallback smaller non-toxic prompt pool",
+      "notes": "Use if 4.8M is too large."
+    },
+    {
+      "id": "HuggingFaceH4/ultrachat_200k",
+      "role": "prompt_bank",
+      "use": "prompts only",
+      "notes": "Broad filtered dialogue/instruction prompt coverage."
+    },
+    {
+      "id": "allenai/tulu-3-sft-mixture",
+      "role": "prompt_bank",
+      "use": "prompts only; balance by subset",
+      "notes": "Mixed subset licenses; do not train on third-party answers."
+    },
+    {
+      "id": "data-is-better-together/10k_prompts_ranked",
+      "role": "pilot_prompt_bank",
+      "use": "local pilot and smoke tests",
+      "notes": "Small enough for early end-to-end validation."
+    },
+    {
+      "id": "HuggingFaceFW/fineweb-edu",
+      "role": "plain_text_warmup_or_context_seed",
+      "use": "optional short denoising warm-up or context seed",
+      "notes": "Prefer over full FineWeb for first-pass quality and practicality."
+    },
+    {
+      "id": "HuggingFaceTB/cosmopedia",
+      "role": "plain_text_warmup_or_context_seed",
+      "use": "structured expository contexts",
+      "notes": "Apache-2.0 synthetic textbooks/blogposts/stories/wikiHow-like text."
+    },
+    {
+      "id": "wikimedia/wikipedia",
+      "config": "20231101.en",
+      "role": "plain_text_warmup_or_context_seed",
+      "use": "encyclopedic contexts",
+      "notes": "Track attribution/license obligations."
+    },
+    {
+      "id": "bigcode/the-stack-v2",
+      "role": "code_context_stream",
+      "use": "code snippets as context or small code warm-up",
+      "notes": "Preserve provenance and source license metadata."
+    },
+    {
+      "id": "EleutherAI/proof-pile-2",
+      "role": "math_science_context_stream",
+      "use": "small math/science context slice",
+      "notes": "Use if math/science behavior is a priority."
+    }
+  ],
+  "avoid_as_primary_targets": [
+    "third-party SFT assistant answers",
+    "narrow single-domain prompt banks",
+    "empty-prompt-only self-continuation",
+    "unfiltered raw crawl dumps"
+  ],
+  "teacher_output_filters": {
+    "min_estimated_tokens": 32,
+    "drop_empty": true,
+    "drop_near_duplicates": true,
+    "drop_greeting_boilerplate": true,
+    "drop_endpoint_failure_text": true
+  }
+}

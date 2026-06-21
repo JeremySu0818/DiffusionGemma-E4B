@@ -3,8 +3,15 @@ __pycache__/
 .pytest_cache/
 .venv/
 outputs/logs/*.log
+outputs/local_probe/
+outputs/validation/
 artifacts/conversion_training/
 artifacts/transplanted/
+artifacts/*.tar.gz
+artifacts/*.tar.gz.json
 data/raw_self_continuation/self_continuation.jsonl
 data/raw_self_continuation/progress.json
+data/raw_self_continuation/*validation*.jsonl
+data/raw_self_continuation/*validation*.json
 data/corruption/
+data/corruption_validation/
