@@ -231,7 +231,7 @@ def generate_records(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime", choices=["lmstudio", "ollama", "llamacpp", "openai-compatible"], default="lmstudio")
-    parser.add_argument("--model", default="google/gemma-4-e4b")
+    parser.add_argument("--model", default="google/gemma-4-E4B-it")
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--input-jsonl", type=Path, default=None)
     parser.add_argument("--source-config", type=Path, default=Path("configs/dataset_sources.json"))

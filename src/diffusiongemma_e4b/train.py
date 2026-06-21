@@ -231,7 +231,8 @@ def train(args) -> dict:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate)
 
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and torch.cuda.is_available())
+    use_scaler = args.amp and torch.cuda.is_available() and args.dtype != "bfloat16"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
     state = load_state_if_available(optimizer, scaler, output_dir) if args.resume else TrainState()
     log_path = output_dir / "train_log.jsonl"
     model.train()

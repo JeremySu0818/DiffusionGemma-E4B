@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 Set-Location $RepoRoot
 
-$model = if ($env:DG_MODEL) { $env:DG_MODEL } else { "google/gemma-4-e4b" }
+$model = if ($env:DG_MODEL) { $env:DG_MODEL } else { "google/gemma-4-E4B-it" }
 Write-Host "Starting LM-Studio server and loading model: $model..." -ForegroundColor Cyan
 lms server start | Out-Host
 lms load $model | Out-Host
