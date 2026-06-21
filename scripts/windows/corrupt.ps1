@@ -1,5 +1,10 @@
 $ErrorActionPreference = "Stop"
-Set-Location (Split-Path -Parent $PSScriptRoot)
+
+# Get the repo root directory
+$RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
+Set-Location $RepoRoot
+
+Write-Host "Running block corruption data preparation..." -ForegroundColor Cyan
 python -m diffusiongemma_e4b.corruption `
   --raw-jsonl data/raw_self_continuation/self_continuation.jsonl `
   --output-dir data/corruption `

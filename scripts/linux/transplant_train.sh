@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /workspace/DiffusionGemma-E4B
+
+# Locate repository directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_DIR"
+
 source .venv/bin/activate
+
+echo "Stage 1: Weight Transplantation..."
 python -m diffusiongemma_e4b.student \
   --base-model google/gemma-4-E4B-it \
   --output-dir artifacts/transplanted \
   --canvas-length 256 \
   --dtype bfloat16 \
   --device-map auto
+
+echo "Stage 2: Model Training (QLoRA)..."
 python -m diffusiongemma_e4b.train \
   --model-dir artifacts/transplanted \
   --data-dir data/corruption \

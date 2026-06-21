@@ -12,4 +12,5 @@ Formal training data policy:
 - No hand-written training prompts.
 - Formal records are prompt-free self-continuation text streams produced by Gemma 4 E4B itself.
 
-Key commands are in `scripts/`. The full RunPod handoff is in `docs/RUNPOD_HANDOFF.md`.
+Key commands are organized in [scripts/linux/](file:///mnt/c/AI/DiffusionGemma-E4B/scripts/linux) and [scripts/windows/](file:///mnt/c/AI/DiffusionGemma-E4B/scripts/windows). The full deployment guide is in [DEPLOYMENT_GUIDE.md](file:///mnt/c/AI/DiffusionGemma-E4B/docs/DEPLOYMENT_GUIDE.md).
+

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /workspace/DiffusionGemma-E4B
+
+# Locate repository directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_DIR"
+
 source .venv/bin/activate
 python -m diffusiongemma_e4b.corruption \
   --raw-jsonl data/raw_self_continuation/self_continuation.jsonl \

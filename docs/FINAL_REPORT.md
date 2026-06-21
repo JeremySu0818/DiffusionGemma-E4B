@@ -7,7 +7,8 @@ Execution date: 2026-06-19 Asia/Taipei.
 - `src/diffusiongemma_e4b/`: executable Python package for config conversion, teacher generation, corruption shards, weight transplant, conversion training, strict diffusion inference, validation, export, and local feasibility probing.
 - `configs/diffusiongemma-e4b/config.json`: Gemma 4 E4B-derived DiffusionGemma config, canvas length 256.
 - `artifacts/tokenizer_processor_gemma4_e4b/`: Gemma 4 E4B tokenizer, processor, special-token, and chat-template compatibility files saved locally.
-- `docs/RUNPOD_HANDOFF.md`: command-level RunPod handoff.
+- [DEPLOYMENT_GUIDE.md](file:///mnt/c/AI/DiffusionGemma-E4B/docs/DEPLOYMENT_GUIDE.md): command-level cloud and local deployment guide.
+
 - `docs/DATASET_SOURCE_PLAN.md`: dataset source plan for teacher-stream generation and optional denoising warm-up.
 - Validation-only data, local probe outputs, and repro bundles were generated during the local smoke run but are no longer retained in the repository after cleanup.
 
@@ -98,12 +99,13 @@ No formal trained DiffusionGemma-E4B checkpoint is claimed in this local run.
 
 The folder does not contain a completed formal LoRA/QLoRA/full checkpoint trained on >=50,000,000 self-generated tokens and >=200,000 diffusion target blocks. Creating a fake checkpoint was intentionally not done.
 
-## RunPod First Command
+## Cloud Deployment First Command
 
-After creating the RunPod pod and placing this project at `/workspace/DiffusionGemma-E4B`, run:
+After creating the GPU instance and placing this project at `/workspace/DiffusionGemma-E4B`, run:
 
 ```bash
-cd /workspace/DiffusionGemma-E4B && bash scripts/runpod_setup.sh
+cd /workspace/DiffusionGemma-E4B && bash scripts/linux/setup.sh
 ```
 
-Then follow `docs/RUNPOD_HANDOFF.md` exactly.
+Then follow [DEPLOYMENT_GUIDE.md](file:///mnt/c/AI/DiffusionGemma-E4B/docs/DEPLOYMENT_GUIDE.md) exactly.
+
