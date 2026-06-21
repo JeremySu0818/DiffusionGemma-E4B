@@ -14,3 +14,4 @@ data/teacher_supervised/
 data/media_cache/
 data/corruption/
 data/corruption_validation/
+*.egg-info/
