@@ -24,6 +24,6 @@ then
 fi
 
 echo "vLLM is not installed in this environment." >&2
-echo "Install it with: pip install vllm" >&2
+echo "Install it with: uv pip install vllm" >&2
 echo "Or start any OpenAI-compatible server and set DG_TEACHER_BASE_URL." >&2
 exit 1

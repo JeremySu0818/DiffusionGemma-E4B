@@ -15,12 +15,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_DIR"
 
+# Automatically install uv if not present
+if ! command -v uv &> /dev/null; then
+  echo "uv is not installed. Installing uv..."
+  if command -v curl &> /dev/null; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+  elif command -v wget &> /dev/null; then
+    wget -qO- https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+  else
+    python3.11 -m pip install --user uv || python3 -m pip install --user uv || pip install --user uv
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+fi
+
+# Ensure uv is in PATH
+export PATH="$HOME/.local/bin:$PATH"
+
 echo "Setting up virtual environment in $REPO_DIR..."
-python3.11 -m venv .venv
+uv venv .venv --python python3.11
 source .venv/bin/activate
-python -m pip install -U pip wheel setuptools
-pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
-pip install -e .[train,dev]
-pip install vllm || true
-pip install flash-attn --no-build-isolation || true
+uv pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+uv pip install -e .[train,dev]
+uv pip install vllm || true
+uv pip install flash-attn --no-build-isolation || true
 python -m diffusiongemma_e4b.config --base-model google/gemma-4-E4B-it --output-dir configs/diffusiongemma-e4b

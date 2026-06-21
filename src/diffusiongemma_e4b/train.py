@@ -107,7 +107,7 @@ def maybe_apply_lora(model, args):
     try:
         from peft import LoraConfig, TaskType, get_peft_model
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("PEFT is required for LoRA/QLoRA training. Install with `pip install peft`.") from exc
+        raise RuntimeError("PEFT is required for LoRA/QLoRA training. Install with `uv pip install peft`.") from exc
 
     target_modules = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
     config = LoraConfig(
