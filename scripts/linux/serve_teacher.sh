@@ -7,6 +7,13 @@ cd "$REPO_DIR"
 
 source .venv/bin/activate
 
+# Dynamically add virtual environment NVIDIA CUDA libraries to LD_LIBRARY_PATH
+for d in "${REPO_DIR}"/.venv/lib/python3.*/site-packages/nvidia/*/lib; do
+  if [ -d "$d" ]; then
+    export LD_LIBRARY_PATH="$d:${LD_LIBRARY_PATH:-}"
+  fi
+done
+
 MODEL="${DG_MODEL:-google/gemma-4-E4B-it}"
 HOST="${DG_TEACHER_HOST:-0.0.0.0}"
 PORT="${DG_TEACHER_PORT:-8000}"
