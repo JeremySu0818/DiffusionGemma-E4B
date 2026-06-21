@@ -2,6 +2,6 @@
   "base_model": "google/gemma-4-E4B-it",
   "canvas_length": 256,
   "dtype": "bfloat16",
-  "student_architecture": "transformers.DiffusionGemmaForBlockDiffusion",
-  "conversion": "Gemma 4 E4B text_config transplanted into DiffusionGemma block diffusion config"
+  "student_architecture": "diffusiongemma_e4b.modeling_multimodal.MultimodalDiffusionGemmaForBlockDiffusion",
+  "conversion": "Gemma 4 E4B multimodal config transplanted into DiffusionGemma block diffusion config"
 }

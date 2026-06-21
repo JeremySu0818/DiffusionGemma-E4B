@@ -46,12 +46,13 @@ def estimate_training_memory(base_model: str) -> dict:
     text = cfg.text_config
     try:
         from accelerate import init_empty_weights
-        from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
+
+        from .modeling_multimodal import MultimodalDiffusionGemmaForBlockDiffusion
 
         with init_empty_weights():
-            model = DiffusionGemmaForBlockDiffusion(cfg)
+            model = MultimodalDiffusionGemmaForBlockDiffusion(cfg)
         min_params = sum(p.numel() for p in model.parameters())
-        param_source = "meta_initialized_diffusion_student"
+        param_source = "meta_initialized_multimodal_diffusion_student"
     except Exception:
         min_params = 7.5e9 if text.hidden_size == 2560 and text.num_hidden_layers == 42 else text.hidden_size * text.hidden_size * text.num_hidden_layers * 12
         param_source = "fallback_estimate"
@@ -67,7 +68,7 @@ def estimate_training_memory(base_model: str) -> dict:
         "bf16_weight_floor_gb": round(bf16_weights_gb, 2),
         "qlora_weight_floor_gb": round(qlora_floor_gb, 2),
         "activation_floor_batch1_seq256_gb": round(activation_floor_gb, 2),
-        "recommended_formal_training_vram_gb": 80,
+        "recommended_large_run_vram_gb": 80,
     }
 
 
@@ -105,12 +106,14 @@ def main() -> None:
         "cuda_allocation_probe": cuda_allocation_probe(args.allocation_gb),
     }
     vram = report["gpu"].get("total_vram_gb", 0)
-    report["formal_local_training_feasible"] = bool(vram >= report["training_memory_estimate"]["recommended_formal_training_vram_gb"])
-    report["decision"] = (
-        "runpod_first_cloud_handoff_required"
-        if not report["formal_local_training_feasible"]
-        else "local_formal_training_can_continue"
-    )
+    recommended = report["training_memory_estimate"]["recommended_large_run_vram_gb"]
+    report["large_run_capacity_ok"] = bool(vram >= recommended)
+    report["gpu_capacity_status"] = "large_run_ready" if report["large_run_capacity_ok"] else "capacity_limited_for_large_run"
+    report["notes"] = [
+        "This probe reports local environment capacity only.",
+        "It does not select or require any cloud provider.",
+        "Lower-memory experiments can still run by reducing batch size, using QLoRA, or shrinking step/sample counts.",
+    ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))

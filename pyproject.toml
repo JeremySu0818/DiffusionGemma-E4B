@@ -9,10 +9,13 @@ description = "Gemma 4 E4B to DiffusionGemma-style block diffusion conversion pi
 requires-python = ">=3.11"
 dependencies = [
   "accelerate>=1.11.0",
+  "datasets>=3.0.0",
   "huggingface_hub>=0.36.0",
   "numpy>=1.26",
+  "pillow>=10.0",
   "requests>=2.31",
   "safetensors>=0.5",
+  "soundfile>=0.12",
   "tokenizers>=0.21",
   "torch>=2.12",
   "tqdm>=4.66",

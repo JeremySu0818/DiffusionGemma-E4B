@@ -1,101 +1,288 @@
 {
-  "objective": "DiffusionGemma-E4B conversion while maximizing Gemma 4 E4B behavior preservation",
-  "principle": "Use prompts and contexts to elicit Gemma 4 E4B teacher outputs. Do not use third-party assistant answers as primary training targets.",
+  "objective": "Train a Gemma4 multimodal DiffusionGemma student while maximizing original Gemma4 behavior preservation.",
+  "principle": "Use third-party datasets as prompt/context/raw media sources only. Main targets are Gemma4 teacher-generated outputs conditioned on those inputs. Prompt-free self-continuation is not part of the formal pipeline.",
+  "formal_target_policy": {
+    "teacher_generated_outputs": true,
+    "prompt_free_self_continuation": false,
+    "third_party_assistant_answers_as_primary_targets": false,
+    "raw_corpus_denoising_warmup": "optional"
+  },
   "recommended_mix": [
     {
-      "bucket": "teacher_behavior_stream",
-      "share": 0.7,
-      "target": "Gemma 4 E4B generated outputs from broad prompt/context banks"
+      "bucket": "teacher_supervised_text_prompt_context",
+      "share": 0.35,
+      "target": "Gemma4 teacher outputs from broad text prompt/context banks"
     },
     {
-      "bucket": "denoising_warmup_stream",
-      "share": 0.2,
-      "target": "short optional warm-up on high-quality plain text"
+      "bucket": "teacher_supervised_interleaved_image_text",
+      "share": 0.25,
+      "target": "Gemma4 teacher outputs from interleaved webpage/PDF/image-text contexts"
     },
     {
-      "bucket": "prompt_free_self_continuation",
+      "bucket": "teacher_supervised_image_doc_chart_ocr",
+      "share": 0.15,
+      "target": "Gemma4 teacher outputs from image QA, OCR, documents, charts, diagrams"
+    },
+    {
+      "bucket": "teacher_supervised_video",
+      "share": 0.1,
+      "target": "Gemma4 teacher outputs from sampled video/frame contexts"
+    },
+    {
+      "bucket": "teacher_supervised_audio_speech",
+      "share": 0.08,
+      "target": "Gemma4 teacher outputs from speech/audio contexts"
+    },
+    {
+      "bucket": "teacher_supervised_audio_video",
       "share": 0.05,
-      "target": "repo-original prompt-free teacher generation path"
+      "target": "Gemma4 teacher outputs from synchronized audio-video contexts"
     },
     {
-      "bucket": "evaluation_only",
-      "share": 0.05,
-      "target": "student-vs-teacher behavior comparison prompts"
+      "bucket": "eval_only",
+      "share": 0.02,
+      "target": "student-vs-teacher behavior comparison only"
     }
   ],
-  "green_sources": [
+  "sources": [
     {
-      "id": "lmsys/lmsys-chat-1m",
+      "id": "data-is-better-together/10k_prompts_ranked",
+      "name": "pilot_prompts",
       "role": "prompt_context_bank",
-      "use": "user turns and conversation context only",
-      "notes": "Requires accepting dataset terms on Hugging Face."
+      "modality": "text",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "dataset card terms"
     },
     {
-      "id": "allenai/WildChat-4.8M",
+      "id": "lmsys/lmsys-chat-1m",
+      "name": "lmsys_chat_prompts",
       "role": "prompt_context_bank",
-      "use": "non-toxic user inputs only",
-      "notes": "Large real-world user prompt coverage; privacy and dedupe filters required."
+      "modality": "text",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "requires Hugging Face access/terms"
     },
     {
       "id": "allenai/WildChat-nontoxic",
+      "name": "wildchat_nontoxic_prompts",
       "role": "prompt_context_bank",
-      "use": "fallback smaller non-toxic prompt pool",
-      "notes": "Use if 4.8M is too large."
+      "modality": "text",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "dataset card terms"
+    },
+    {
+      "id": "allenai/WildChat-4.8M",
+      "name": "wildchat_full_prompts",
+      "role": "prompt_context_bank",
+      "modality": "text",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "large dataset; enable on cloud after access approval"
     },
     {
       "id": "HuggingFaceH4/ultrachat_200k",
-      "role": "prompt_bank",
-      "use": "prompts only",
-      "notes": "Broad filtered dialogue/instruction prompt coverage."
+      "name": "ultrachat_prompts",
+      "role": "prompt_context_bank",
+      "modality": "text",
+      "split": "train_sft",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "use prompts only"
     },
     {
       "id": "allenai/tulu-3-sft-mixture",
-      "role": "prompt_bank",
-      "use": "prompts only; balance by subset",
-      "notes": "Mixed subset licenses; do not train on third-party answers."
-    },
-    {
-      "id": "data-is-better-together/10k_prompts_ranked",
-      "role": "pilot_prompt_bank",
-      "use": "local pilot and smoke tests",
-      "notes": "Small enough for early end-to-end validation."
+      "name": "tulu3_prompt_mix",
+      "role": "prompt_context_bank",
+      "modality": "text",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "mixed subsets; use prompts only"
     },
     {
       "id": "HuggingFaceFW/fineweb-edu",
+      "name": "fineweb_edu_context",
       "role": "plain_text_warmup_or_context_seed",
-      "use": "optional short denoising warm-up or context seed",
-      "notes": "Prefer over full FineWeb for first-pass quality and practicality."
+      "modality": "text",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "dataset card terms"
     },
     {
-      "id": "HuggingFaceTB/cosmopedia",
+      "id": "allenai/dolma",
+      "name": "dolma_context",
       "role": "plain_text_warmup_or_context_seed",
-      "use": "structured expository contexts",
-      "notes": "Apache-2.0 synthetic textbooks/blogposts/stories/wikiHow-like text."
+      "modality": "text",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "large; enable when storage/network budget is available"
     },
     {
-      "id": "wikimedia/wikipedia",
-      "config": "20231101.en",
+      "id": "togethercomputer/RedPajama-Data-V2",
+      "name": "redpajama_v2_context",
       "role": "plain_text_warmup_or_context_seed",
-      "use": "encyclopedic contexts",
-      "notes": "Track attribution/license obligations."
+      "modality": "text",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "large; enable when storage/network budget is available"
     },
     {
       "id": "bigcode/the-stack-v2",
+      "name": "stack_v2_code_context",
       "role": "code_context_stream",
-      "use": "code snippets as context or small code warm-up",
-      "notes": "Preserve provenance and source license metadata."
+      "modality": "code",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "preserve license/provenance metadata"
     },
     {
-      "id": "EleutherAI/proof-pile-2",
-      "role": "math_science_context_stream",
-      "use": "small math/science context slice",
-      "notes": "Use if math/science behavior is a priority."
+      "id": "mlfoundations/MINT-1T-HTML",
+      "name": "mint1t_interleaved",
+      "role": "interleaved_image_text_context",
+      "modality": "image_text_interleaved",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "very large; enable on cloud"
+    },
+    {
+      "id": "HuggingFaceM4/OBELICS",
+      "name": "obelics_interleaved",
+      "role": "interleaved_image_text_context",
+      "modality": "image_text_interleaved",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "large; dataset card terms"
+    },
+    {
+      "id": "lmms-lab/LLaVA-ReCap-558K",
+      "name": "llava_recap_image_context",
+      "role": "image_text_context",
+      "modality": "image",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "use image/prompt/context only"
+    },
+    {
+      "id": "HuggingFaceM4/DocumentVQA",
+      "name": "docvqa",
+      "role": "document_ocr_context",
+      "modality": "image",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "document/image QA context"
+    },
+    {
+      "id": "HuggingFaceM4/ChartQA",
+      "name": "chartqa",
+      "role": "chart_context",
+      "modality": "image",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "chart/image QA context"
+    },
+    {
+      "id": "lmms-lab/ScienceQA",
+      "name": "scienceqa_diagrams",
+      "role": "science_diagram_context",
+      "modality": "image",
+      "split": "train",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "science/diagram context"
+    },
+    {
+      "id": "lmms-lab/Video-MME",
+      "name": "video_mme_eval_context",
+      "role": "video_eval_context",
+      "modality": "video",
+      "split": "test",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "eval/prompt context"
+    },
+    {
+      "id": "OpenGVLab/InternVid",
+      "name": "internvid_video_context",
+      "role": "video_context",
+      "modality": "video",
+      "enabled": true,
+      "manifest_only": true,
+      "license_hint": "large external media; use manifest/raw media processor path"
+    },
+    {
+      "id": "webvid/webvid-10m",
+      "name": "webvid10m_video_context",
+      "role": "video_context",
+      "modality": "video",
+      "enabled": true,
+      "manifest_only": true,
+      "license_hint": "large external media; use manifest/raw media processor path"
+    },
+    {
+      "id": "mozilla-foundation/common_voice_19_0",
+      "name": "common_voice_speech",
+      "role": "speech_audio_context",
+      "modality": "audio",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "speech dataset; select language config explicitly if needed"
+    },
+    {
+      "id": "speechcolab/gigaspeech",
+      "name": "gigaspeech",
+      "role": "speech_audio_context",
+      "modality": "audio",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "large speech dataset"
+    },
+    {
+      "id": "agkphysics/AudioSet",
+      "name": "audioset",
+      "role": "general_audio_context",
+      "modality": "audio",
+      "enabled": true,
+      "manifest_only": true,
+      "license_hint": "audio/video labels; use media manifest path"
+    },
+    {
+      "id": "cvssp/audiocaps",
+      "name": "audiocaps",
+      "role": "audio_caption_context",
+      "modality": "audio",
+      "enabled": true,
+      "streaming": true,
+      "license_hint": "audio caption context"
+    },
+    {
+      "id": "Ego4D",
+      "name": "ego4d_audio_video",
+      "role": "audio_video_context",
+      "modality": "audio_video",
+      "enabled": true,
+      "manifest_only": true,
+      "license_hint": "external registration/download; use raw media processor path"
     }
   ],
   "avoid_as_primary_targets": [
     "third-party SFT assistant answers",
-    "narrow single-domain prompt banks",
-    "empty-prompt-only self-continuation",
+    "empty-prompt or prompt-free self-continuation",
+    "narrow single-domain prompt banks as the only source",
     "unfiltered raw crawl dumps"
   ],
   "teacher_output_filters": {

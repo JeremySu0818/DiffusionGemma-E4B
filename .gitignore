@@ -9,9 +9,8 @@ artifacts/conversion_training/
 artifacts/transplanted/
 artifacts/*.tar.gz
 artifacts/*.tar.gz.json
-data/raw_self_continuation/self_continuation.jsonl
-data/raw_self_continuation/progress.json
-data/raw_self_continuation/*validation*.jsonl
-data/raw_self_continuation/*validation*.json
+data/prompt_context/
+data/teacher_supervised/
+data/media_cache/
 data/corruption/
 data/corruption_validation/

@@ -12,9 +12,20 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
 from .constants import CANVAS_LENGTH
+from .modeling_multimodal import MultimodalDiffusionGemmaForBlockDiffusion
+
+
+MULTIMODAL_BATCH_KEYS = (
+    "pixel_values",
+    "pixel_values_videos",
+    "input_features",
+    "input_features_mask",
+    "image_position_ids",
+    "video_position_ids",
+    "mm_token_type_ids",
+)
 
 
 @dataclass
@@ -35,7 +46,7 @@ class CorruptionShardDataset(Dataset):
         for path in self.files:
             with np.load(path) as shard:
                 n = shard["target_ids"].shape[0]
-            val_cut = max(1, int(n * val_fraction))
+            val_cut = min(max(1, int(n * val_fraction)), n - 1) if n > 1 else 0
             rows = range(0, val_cut) if split == "val" else range(val_cut, n)
             self.index.extend((path, i) for i in rows)
         if not self.index:
@@ -65,15 +76,29 @@ class CorruptionShardDataset(Dataset):
         if prefix_len:
             mask[-prefix_len:] = 1
         return {
+            **self._optional_multimodal_tensors(shard, row),
             "input_ids": torch.from_numpy(prefix),
             "attention_mask": torch.from_numpy(mask),
             "decoder_input_ids": torch.from_numpy(corrupted),
             "labels": torch.from_numpy(target),
         }
 
+    def _optional_multimodal_tensors(self, shard, row: int) -> dict[str, torch.Tensor]:
+        tensors = {}
+        for key in MULTIMODAL_BATCH_KEYS:
+            if key not in shard:
+                continue
+            value = shard[key][row]
+            if key in {"pixel_values", "pixel_values_videos", "input_features"}:
+                tensors[key] = torch.from_numpy(value.astype(np.float32))
+            else:
+                tensors[key] = torch.from_numpy(value.astype(np.int64))
+        return tensors
+
 
 def collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    return {k: torch.stack([item[k] for item in batch]) for k in batch[0]}
+    keys = sorted(set().union(*(item.keys() for item in batch)))
+    return {k: torch.stack([item[k] for item in batch]) for k in keys if all(k in item for item in batch)}
 
 
 def maybe_apply_lora(model, args):
@@ -118,7 +143,7 @@ def load_model(args):
     }
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
-    model = DiffusionGemmaForBlockDiffusion.from_pretrained(args.model_dir, **kwargs)
+    model = MultimodalDiffusionGemmaForBlockDiffusion.from_pretrained(args.model_dir, **kwargs)
     model = maybe_apply_lora(model, args)
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
@@ -128,6 +153,7 @@ def load_model(args):
 def compute_loss(model, batch: dict[str, torch.Tensor], self_conditioning_prob: float) -> torch.Tensor:
     device = next(model.parameters()).device
     batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+    multimodal_kwargs = {k: batch[k] for k in MULTIMODAL_BATCH_KEYS if k in batch}
     self_conditioning_logits = None
     self_conditioning_mask = None
     if self_conditioning_prob > 0:
@@ -136,6 +162,7 @@ def compute_loss(model, batch: dict[str, torch.Tensor], self_conditioning_prob: 
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 decoder_input_ids=batch["decoder_input_ids"],
+                **multimodal_kwargs,
             )
         self_conditioning_logits = first.logits.detach()
         probs = torch.rand(batch["input_ids"].shape[0], device=device) < self_conditioning_prob
@@ -147,6 +174,7 @@ def compute_loss(model, batch: dict[str, torch.Tensor], self_conditioning_prob: 
         decoder_input_ids=batch["decoder_input_ids"],
         self_conditioning_logits=self_conditioning_logits,
         self_conditioning_mask=self_conditioning_mask,
+        **multimodal_kwargs,
     )
     logits = out.logits.float()
     labels = batch["labels"]

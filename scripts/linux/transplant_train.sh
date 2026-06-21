@@ -10,25 +10,25 @@ source .venv/bin/activate
 
 echo "Stage 1: Weight Transplantation..."
 python -m diffusiongemma_e4b.student \
-  --base-model google/gemma-4-E4B-it \
-  --output-dir artifacts/transplanted \
-  --canvas-length 256 \
-  --dtype bfloat16 \
-  --device-map auto
+  --base-model "${DG_MODEL:-google/gemma-4-E4B-it}" \
+  --output-dir "${DG_TRANSPLANT_DIR:-artifacts/transplanted}" \
+  --canvas-length "${DG_CANVAS_LENGTH:-256}" \
+  --dtype "${DG_DTYPE:-bfloat16}" \
+  --device-map "${DG_DEVICE_MAP:-auto}"
 
 echo "Stage 2: Model Training (QLoRA)..."
 python -m diffusiongemma_e4b.train \
-  --model-dir artifacts/transplanted \
-  --data-dir data/corruption \
-  --output-dir artifacts/conversion_training \
-  --train-mode qlora \
-  --batch-size 1 \
-  --gradient-accumulation-steps 32 \
-  --learning-rate 2e-4 \
-  --max-steps 200000 \
-  --save-interval 1000 \
-  --val-interval 500 \
-  --val-batches 16 \
-  --self-conditioning-prob 0.5 \
+  --model-dir "${DG_TRANSPLANT_DIR:-artifacts/transplanted}" \
+  --data-dir "${DG_CORRUPTION_DIR:-data/corruption}" \
+  --output-dir "${DG_TRAIN_OUTPUT_DIR:-artifacts/conversion_training}" \
+  --train-mode "${DG_TRAIN_MODE:-qlora}" \
+  --batch-size "${DG_BATCH_SIZE:-1}" \
+  --gradient-accumulation-steps "${DG_GRAD_ACCUM:-32}" \
+  --learning-rate "${DG_LR:-2e-4}" \
+  --max-steps "${DG_MAX_STEPS:-200000}" \
+  --save-interval "${DG_SAVE_INTERVAL:-1000}" \
+  --val-interval "${DG_VAL_INTERVAL:-500}" \
+  --val-batches "${DG_VAL_BATCHES:-16}" \
+  --self-conditioning-prob "${DG_SELF_CONDITIONING_PROB:-0.5}" \
   --gradient-checkpointing \
   --resume

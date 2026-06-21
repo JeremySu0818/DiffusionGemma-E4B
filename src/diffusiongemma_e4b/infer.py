@@ -6,9 +6,10 @@ from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
-from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
 from .constants import CANVAS_LENGTH
+from .modeling_multimodal import MultimodalDiffusionGemmaForBlockDiffusion
+from .train import MULTIMODAL_BATCH_KEYS
 
 
 def entropy_from_logits(logits: torch.Tensor, temperature: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -52,10 +53,16 @@ def strict_diffusion_generate(
     stability_steps: int,
     temperature: float,
     seed: int,
+    encoder_inputs: dict[str, torch.Tensor] | None = None,
 ) -> dict:
     device = next(model.parameters()).device
-    input_ids = tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").to(device)
-    attention_mask = torch.ones_like(input_ids)
+    encoder_inputs = dict(encoder_inputs or {})
+    if "input_ids" in encoder_inputs:
+        input_ids = encoder_inputs.pop("input_ids").to(device)
+        encoder_inputs.pop("attention_mask", None)
+    else:
+        input_ids = tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").to(device)
+    encoder_inputs = {k: v.to(device) for k, v in encoder_inputs.items()}
     committed = input_ids
     blocks = []
     generator = torch.Generator(device=device)
@@ -75,6 +82,7 @@ def strict_diffusion_generate(
                 attention_mask=torch.ones_like(committed),
                 decoder_input_ids=canvas,
                 self_conditioning_logits=self_conditioning_logits,
+                **encoder_inputs,
             )
             logits = out.logits
             canvas, argmax_canvas, entropy = entropy_bound_step(
@@ -105,6 +113,19 @@ def strict_diffusion_generate(
     }
 
 
+def load_encoder_inputs(path: Path | None) -> dict[str, torch.Tensor]:
+    if path is None:
+        return {}
+    import numpy as np
+
+    tensors = {}
+    with np.load(path) as data:
+        for key in ("input_ids", "attention_mask", *MULTIMODAL_BATCH_KEYS):
+            if key in data:
+                tensors[key] = torch.from_numpy(data[key])
+    return tensors
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=Path, required=True)
@@ -121,11 +142,12 @@ def main() -> None:
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--encoder-input-npz", type=Path, default=None)
     args = parser.parse_args()
 
     tokenizer_path = args.tokenizer or args.model_dir
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-    model = DiffusionGemmaForBlockDiffusion.from_pretrained(
+    model = MultimodalDiffusionGemmaForBlockDiffusion.from_pretrained(
         args.model_dir,
         dtype=getattr(torch, args.dtype),
         device_map=args.device_map,
@@ -144,6 +166,7 @@ def main() -> None:
         args.stability_steps,
         args.temperature,
         args.seed,
+        load_encoder_inputs(args.encoder_input_npz),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")

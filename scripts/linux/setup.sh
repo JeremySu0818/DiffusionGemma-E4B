@@ -21,5 +21,6 @@ source .venv/bin/activate
 python -m pip install -U pip wheel setuptools
 pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
 pip install -e .[train,dev]
+pip install vllm || true
 pip install flash-attn --no-build-isolation || true
 python -m diffusiongemma_e4b.config --base-model google/gemma-4-E4B-it --output-dir configs/diffusiongemma-e4b

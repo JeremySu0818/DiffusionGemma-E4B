@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 import torch
 from transformers import AutoTokenizer
-from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
 from .constants import CANVAS_LENGTH
+from .modeling_multimodal import MultimodalDiffusionGemmaForBlockDiffusion
 
 
 def validate_artifact_files(model_dir: Path) -> dict:
@@ -38,7 +38,7 @@ def validate_tokenizer(model_dir: Path) -> dict:
 
 
 def validate_forward(model_dir: Path, data_dir: Path, dtype: str, device_map: str) -> dict:
-    model = DiffusionGemmaForBlockDiffusion.from_pretrained(
+    model = MultimodalDiffusionGemmaForBlockDiffusion.from_pretrained(
         model_dir,
         dtype=getattr(torch, dtype),
         device_map=device_map,

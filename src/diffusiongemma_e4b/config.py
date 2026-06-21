@@ -77,18 +77,26 @@ def build_diffusion_e4b_config(
     vision_config = None
     if getattr(base_cfg, "vision_config", None) is not None:
         vision_config = base_cfg.vision_config.to_dict()
+    audio_config = None
+    if getattr(base_cfg, "audio_config", None) is not None:
+        audio_config = base_cfg.audio_config.to_dict()
 
     cfg = DiffusionGemmaConfig(
         text_config=text_config,
         vision_config=vision_config,
+        audio_config=audio_config,
         canvas_length=canvas_length,
         dtype=dtype,
         tie_word_embeddings=getattr(base_cfg, "tie_word_embeddings", True),
         boi_token_id=getattr(base_cfg, "boi_token_id", 255999),
         eoi_token_id=getattr(base_cfg, "eoi_token_id", 258882),
         image_token_id=getattr(base_cfg, "image_token_id", 258880),
+        video_token_id=getattr(base_cfg, "video_token_id", 258884),
+        boa_token_id=getattr(base_cfg, "boa_token_id", 256000),
+        eoa_token_index=getattr(base_cfg, "eoa_token_index", 258883),
+        audio_token_id=getattr(base_cfg, "audio_token_id", 258881),
     )
-    cfg.architectures = ["DiffusionGemmaForBlockDiffusion"]
+    cfg.architectures = ["MultimodalDiffusionGemmaForBlockDiffusion"]
     cfg.name_or_path = "DiffusionGemma-E4B"
     return cfg
 
@@ -101,8 +109,8 @@ def save_config(output_dir: Path, base_model: str, canvas_length: int, dtype: st
         "base_model": base_model,
         "canvas_length": canvas_length,
         "dtype": dtype,
-        "student_architecture": "transformers.DiffusionGemmaForBlockDiffusion",
-        "conversion": "Gemma 4 E4B text_config transplanted into DiffusionGemma block diffusion config",
+        "student_architecture": "diffusiongemma_e4b.modeling_multimodal.MultimodalDiffusionGemmaForBlockDiffusion",
+        "conversion": "Gemma 4 E4B multimodal config transplanted into DiffusionGemma block diffusion config",
     }
     (output_dir / "diffusiongemma_e4b_config_metadata.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"

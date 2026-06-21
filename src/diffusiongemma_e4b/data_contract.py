@@ -1,42 +1,35 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable
-
-from .constants import FORBIDDEN_PROMPT_PATH_PARTS, FORBIDDEN_TEST_ONLY_PROMPTS
+from typing import Any, Iterable
 
 
 @dataclass
-class SelfContinuationRecord:
+class TeacherSupervisedRecord:
     id: str
     source_model: str
     runtime: str
+    prompt_text: str
     text: str
     estimated_tokens: int
-    prompt_source: str = "prompt_free"
-    prompt_text: str = ""
+    prompt_source: str
+    modality: str = "text"
+    context_text: str = ""
+    media: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate_formal(self) -> None:
-        if self.prompt_text.strip():
-            raise ValueError("formal self-continuation record contains prompt_text")
-        text_l = self.text.lower()
-        for forbidden in FORBIDDEN_TEST_ONLY_PROMPTS:
-            if forbidden.lower() in text_l:
-                raise ValueError(f"record contains forbidden test-only prompt: {forbidden}")
-        if self.prompt_source != "prompt_free":
-            raise ValueError(f"invalid prompt_source for formal data: {self.prompt_source}")
+        if not self.prompt_text.strip() and not self.context_text.strip() and not self.media:
+            raise ValueError("teacher-supervised record requires prompt_text, context_text, or media")
+        if self.prompt_source == "prompt_free":
+            raise ValueError("prompt-free self-generation is disabled for the formal pipeline")
+        if not self.text.strip():
+            raise ValueError("teacher-supervised record has empty teacher output")
 
 
-def reject_curated_prompt_path(path: Path) -> None:
-    parts = {p.lower().replace(".txt", "").replace(".md", "") for p in path.parts}
-    bad = parts.intersection(FORBIDDEN_PROMPT_PATH_PARTS)
-    if bad:
-        raise ValueError(f"formal data cannot read curated prompt paths: {sorted(bad)}")
-
-
-def write_jsonl(path: Path, records: Iterable[SelfContinuationRecord]) -> int:
+def write_teacher_jsonl(path: Path, records: Iterable[TeacherSupervisedRecord]) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     with path.open("a", encoding="utf-8") as f:
@@ -48,7 +41,6 @@ def write_jsonl(path: Path, records: Iterable[SelfContinuationRecord]) -> int:
 
 
 def iter_jsonl(path: Path) -> Iterable[dict]:
-    reject_curated_prompt_path(path)
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()

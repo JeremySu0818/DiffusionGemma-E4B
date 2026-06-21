@@ -8,10 +8,10 @@ from typing import Iterable
 import torch
 import transformers
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
-from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
 from .config import build_diffusion_e4b_config
 from .constants import CANVAS_LENGTH, DEFAULT_BASE_MODEL
+from .modeling_multimodal import MultimodalDiffusionGemmaForBlockDiffusion
 
 
 BASE_PREFIXES = (
@@ -22,13 +22,31 @@ BASE_PREFIXES = (
 )
 
 
+def _family_for_target(key: str) -> str:
+    if key.startswith("model.encoder.language_model."):
+        return "text_encoder"
+    if key.startswith("model.encoder.vision_tower."):
+        return "vision_tower"
+    if key.startswith("model.encoder.embed_vision."):
+        return "vision_projector"
+    if key.startswith("model.encoder.audio_tower."):
+        return "audio_tower"
+    if key.startswith("model.encoder.embed_audio."):
+        return "audio_projector"
+    if key.startswith("model.decoder."):
+        return "diffusion_decoder"
+    if key == "lm_head.weight":
+        return "lm_head"
+    return "unsupported"
+
+
 def create_diffusion_e4b_model(
     base_model: str = DEFAULT_BASE_MODEL,
     canvas_length: int = CANVAS_LENGTH,
     dtype: str = "bfloat16",
-) -> DiffusionGemmaForBlockDiffusion:
+) -> MultimodalDiffusionGemmaForBlockDiffusion:
     cfg = build_diffusion_e4b_config(base_model, canvas_length, dtype)
-    return DiffusionGemmaForBlockDiffusion(cfg)
+    return MultimodalDiffusionGemmaForBlockDiffusion(cfg)
 
 
 def _strip_base_prefix(key: str) -> str | None:
@@ -44,8 +62,43 @@ def _layer_source(prefix: str, suffix: str, suffix_to_tensor: dict[str, torch.Te
     return suffix_to_tensor.get(f"{prefix}.{suffix}")
 
 
+def _target_source_suffix(dkey: str) -> str | None:
+    if dkey.startswith("model.encoder.language_model."):
+        return dkey[len("model.encoder.language_model.") :]
+    if dkey.startswith("model.encoder.vision_tower."):
+        return dkey[len("model.encoder.") :]
+    if dkey.startswith("model.encoder.embed_vision."):
+        return dkey[len("model.encoder.") :]
+    if dkey.startswith("model.encoder.audio_tower."):
+        return dkey[len("model.encoder.") :]
+    if dkey.startswith("model.encoder.embed_audio."):
+        return dkey[len("model.encoder.") :]
+    if dkey.startswith("model.decoder."):
+        return dkey[len("model.decoder.") :]
+    if dkey == "lm_head.weight":
+        return "lm_head.weight"
+    return None
+
+
+def _empty_family_counts() -> dict[str, int]:
+    return {
+        "text_encoder": 0,
+        "vision_tower": 0,
+        "vision_projector": 0,
+        "audio_tower": 0,
+        "audio_projector": 0,
+        "diffusion_decoder": 0,
+        "lm_head": 0,
+    }
+
+
+def _add_family_count(counts: dict[str, int], family: str) -> None:
+    if family in counts:
+        counts[family] += 1
+
+
 def make_transplant_state_dict(base_state: dict[str, torch.Tensor], diffusion_state: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], dict]:
-    diffusion_keys = set(diffusion_state.keys())
+    diffusion_keys = sorted(diffusion_state.keys())
     suffix_to_tensor: dict[str, torch.Tensor] = {}
     for key, tensor in base_state.items():
         suffix = _strip_base_prefix(key)
@@ -53,19 +106,22 @@ def make_transplant_state_dict(base_state: dict[str, torch.Tensor], diffusion_st
             suffix_to_tensor[suffix] = tensor
 
     mapped: dict[str, torch.Tensor] = {}
-    report = {"copied": [], "missing_source": [], "shape_mismatch": []}
+    report = {
+        "copied": [],
+        "missing_source": [],
+        "shape_mismatch": [],
+        "target_count_by_family": _empty_family_counts(),
+        "copied_count_by_family": _empty_family_counts(),
+        "missing_source_count_by_family": _empty_family_counts(),
+        "shape_mismatch_count_by_family": _empty_family_counts(),
+    }
 
     for dkey in diffusion_keys:
-        source_suffix = None
-        if dkey.startswith("model.encoder.language_model."):
-            source_suffix = dkey[len("model.encoder.language_model.") :]
-        elif dkey.startswith("model.decoder."):
-            source_suffix = dkey[len("model.decoder.") :]
-        elif dkey == "lm_head.weight":
-            source_suffix = "lm_head.weight"
-
+        family = _family_for_target(dkey)
+        source_suffix = _target_source_suffix(dkey)
         if source_suffix is None:
             continue
+        _add_family_count(report["target_count_by_family"], family)
         tensor = suffix_to_tensor.get(source_suffix)
         if tensor is None and ".experts.gate_up_proj" in source_suffix:
             layer_prefix = source_suffix.split(".experts.gate_up_proj")[0]
@@ -85,15 +141,46 @@ def make_transplant_state_dict(base_state: dict[str, torch.Tensor], diffusion_st
         if tensor is None and source_suffix == "embed_tokens.weight":
             tensor = suffix_to_tensor.get("embed_tokens.weight")
         if tensor is None:
-            report["missing_source"].append({"target": dkey, "source_suffix": source_suffix})
+            report["missing_source"].append({"target": dkey, "source_suffix": source_suffix, "family": family})
+            _add_family_count(report["missing_source_count_by_family"], family)
             continue
         if tuple(tensor.shape) != tuple(diffusion_state[dkey].shape):
             report["shape_mismatch"].append(
-                {"target": dkey, "source_suffix": source_suffix, "source_shape": list(tensor.shape), "target_shape": list(diffusion_state[dkey].shape)}
+                {
+                    "target": dkey,
+                    "source_suffix": source_suffix,
+                    "source_shape": list(tensor.shape),
+                    "target_shape": list(diffusion_state[dkey].shape),
+                    "family": family,
+                }
             )
+            _add_family_count(report["shape_mismatch_count_by_family"], family)
             continue
         mapped[dkey] = tensor
-        report["copied"].append({"target": dkey, "source_suffix": source_suffix, "shape": list(tensor.shape)})
+        report["copied"].append({"target": dkey, "source_suffix": source_suffix, "shape": list(tensor.shape), "family": family})
+        _add_family_count(report["copied_count_by_family"], family)
+    report["coverage_by_family"] = {
+        family: round(report["copied_count_by_family"][family] / total, 6) if total else None
+        for family, total in report["target_count_by_family"].items()
+    }
+    report["image_text_target_present"] = (
+        report["target_count_by_family"]["vision_tower"] > 0
+        and report["target_count_by_family"]["vision_projector"] > 0
+    )
+    report["image_text_fully_copied"] = (
+        report["image_text_target_present"]
+        and report["coverage_by_family"]["vision_tower"] == 1.0
+        and report["coverage_by_family"]["vision_projector"] == 1.0
+    )
+    report["audio_text_target_present"] = (
+        report["target_count_by_family"]["audio_tower"] > 0
+        and report["target_count_by_family"]["audio_projector"] > 0
+    )
+    report["audio_text_fully_copied"] = (
+        report["audio_text_target_present"]
+        and report["coverage_by_family"]["audio_tower"] == 1.0
+        and report["coverage_by_family"]["audio_projector"] == 1.0
+    )
     return mapped, report
 
 
@@ -173,7 +260,24 @@ def main() -> None:
         None if args.device_map == "none" else args.device_map,
         save_full_model=not args.no_save_full_model,
     )
-    print(json.dumps({k: report[k] for k in ["copied_count", "missing_source_count", "base_model"]}, indent=2))
+    print(
+        json.dumps(
+            {
+                k: report[k]
+                for k in [
+                    "copied_count",
+                    "missing_source_count",
+                    "base_model",
+                    "coverage_by_family",
+                    "image_text_target_present",
+                    "image_text_fully_copied",
+                    "audio_text_target_present",
+                    "audio_text_fully_copied",
+                ]
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

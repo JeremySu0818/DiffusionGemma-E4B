@@ -8,10 +8,10 @@ cd "$REPO_DIR"
 
 source .venv/bin/activate
 python -m diffusiongemma_e4b.corruption \
-  --raw-jsonl data/raw_self_continuation/self_continuation.jsonl \
+  --raw-jsonl data/teacher_supervised/teacher_outputs.jsonl \
   --output-dir data/corruption \
-  --tokenizer google/gemma-4-E4B-it \
-  --target-blocks 200000 \
-  --canvas-length 256 \
-  --prefix-length 512 \
-  --shard-blocks 4096
+  --tokenizer "${DG_MODEL:-google/gemma-4-E4B-it}" \
+  --target-blocks "${DG_TARGET_BLOCKS:-200000}" \
+  --canvas-length "${DG_CANVAS_LENGTH:-256}" \
+  --prefix-length "${DG_PREFIX_LENGTH:-512}" \
+  --shard-blocks "${DG_SHARD_BLOCKS:-4096}"
