@@ -17,7 +17,7 @@ dependencies = [
   "safetensors>=0.5",
   "soundfile>=0.12",
   "tokenizers>=0.21",
-  "torch>=2.12",
+  "torch>=2.11.0",
   "tqdm>=4.66",
   "transformers>=5.12.0",
 ]
