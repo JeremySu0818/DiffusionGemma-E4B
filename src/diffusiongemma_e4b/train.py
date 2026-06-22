@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -13,7 +14,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from .constants import CANVAS_LENGTH
 from .modeling_multimodal import MultimodalDiffusionGemmaForBlockDiffusion
 
 
@@ -29,6 +29,7 @@ MULTIMODAL_BATCH_KEYS = (
 @dataclass
 class TrainState:
     step: int = 0
+    optimizer_steps: int = 0
     epoch: int = 0
     samples_seen: int = 0
     tokens_seen: int = 0
@@ -36,17 +37,19 @@ class TrainState:
 
 
 class CorruptionShardDataset(Dataset):
-    def __init__(self, data_dir: Path, split: str = "train", val_fraction: float = 0.01):
+    def __init__(self, data_dir: Path, split: str = "train", val_fraction: float = 0.01, seed: int = 1337):
         self.files = sorted(data_dir.glob("corruption_*.npz"))
         if not self.files:
             raise FileNotFoundError(f"no corruption_*.npz files in {data_dir}")
-        self.index: list[tuple[Path, int]] = []
+        full_index: list[tuple[Path, int]] = []
         for path in self.files:
             with np.load(path) as shard:
                 n = shard["target_ids"].shape[0]
-            val_cut = min(max(1, int(n * val_fraction)), n - 1) if n > 1 else 0
-            rows = range(0, val_cut) if split == "val" else range(val_cut, n)
-            self.index.extend((path, i) for i in rows)
+            full_index.extend((path, i) for i in range(n))
+        rng = random.Random(seed)
+        rng.shuffle(full_index)
+        val_cut = min(max(1, int(len(full_index) * val_fraction)), len(full_index) - 1) if len(full_index) > 1 else 0
+        self.index = full_index[:val_cut] if split == "val" else full_index[val_cut:]
         if not self.index:
             raise ValueError(f"empty {split} dataset from {data_dir}")
         self._cache_path: Path | None = None
@@ -119,6 +122,14 @@ def maybe_apply_lora(model, args):
     return get_peft_model(model, config)
 
 
+def latest_checkpoint_path(output_dir: Path) -> Path | None:
+    latest = output_dir / "latest_checkpoint.txt"
+    if not latest.exists():
+        return None
+    ckpt = Path(latest.read_text(encoding="utf-8").strip())
+    return ckpt if ckpt.exists() else None
+
+
 def load_model(args):
     dtype = getattr(torch, args.dtype)
     quantization_config = None
@@ -141,8 +152,18 @@ def load_model(args):
     }
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
-    model = MultimodalDiffusionGemmaForBlockDiffusion.from_pretrained(args.model_dir, **kwargs)
-    model = maybe_apply_lora(model, args)
+    ckpt = latest_checkpoint_path(args.output_dir) if args.resume else None
+    full_checkpoint = ckpt if ckpt is not None and (ckpt / "config.json").exists() else None
+    base_path = full_checkpoint or args.model_dir
+    model = MultimodalDiffusionGemmaForBlockDiffusion.from_pretrained(base_path, **kwargs)
+    if args.train_mode != "full" and ckpt is not None and (ckpt / "adapter_config.json").exists():
+        try:
+            from peft import PeftModel
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("PEFT is required to resume LoRA/QLoRA adapter checkpoints.") from exc
+        model = PeftModel.from_pretrained(model, ckpt, is_trainable=True)
+    else:
+        model = maybe_apply_lora(model, args)
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     return model
@@ -192,10 +213,9 @@ def save_checkpoint(model, optimizer, scaler, state: TrainState, output_dir: Pat
 
 
 def load_state_if_available(optimizer, scaler, output_dir: Path) -> TrainState:
-    latest = output_dir / "latest_checkpoint.txt"
-    if not latest.exists():
+    ckpt = latest_checkpoint_path(output_dir)
+    if ckpt is None:
         return TrainState()
-    ckpt = Path(latest.read_text(encoding="utf-8").strip())
     state_path = ckpt / "trainer_state.json"
     if not state_path.exists():
         return TrainState()
@@ -210,7 +230,7 @@ def load_state_if_available(optimizer, scaler, output_dir: Path) -> TrainState:
 
 
 @torch.no_grad()
-def validate(model, loader: DataLoader, batches: int, self_conditioning_prob: float) -> float:
+def validate(model, loader: DataLoader, batches: int) -> float:
     model.eval()
     losses = []
     for i, batch in enumerate(loader):
@@ -224,10 +244,17 @@ def validate(model, loader: DataLoader, batches: int, self_conditioning_prob: fl
 def train(args) -> dict:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     model = load_model(args)
-    train_ds = CorruptionShardDataset(args.data_dir, split="train", val_fraction=args.val_fraction)
-    val_ds = CorruptionShardDataset(args.data_dir, split="val", val_fraction=args.val_fraction)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate)
+    train_ds = CorruptionShardDataset(args.data_dir, split="train", val_fraction=args.val_fraction, seed=args.seed)
+    val_ds = CorruptionShardDataset(args.data_dir, split="val", val_fraction=args.val_fraction, seed=args.seed)
+    data_generator = torch.Generator()
+    data_generator.manual_seed(args.seed)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate, generator=data_generator)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate)
 
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay)
@@ -253,6 +280,7 @@ def train(args) -> dict:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                state.optimizer_steps += 1
 
             state.step += 1
             state.samples_seen += int(batch["labels"].shape[0])
@@ -263,9 +291,10 @@ def train(args) -> dict:
                 "loss": float(loss.detach().cpu()) * args.gradient_accumulation_steps,
                 "samples_seen": state.samples_seen,
                 "tokens_seen": state.tokens_seen,
+                "optimizer_steps": state.optimizer_steps,
             }
             if state.step % args.val_interval == 0:
-                row["val_loss"] = validate(model, val_loader, args.val_batches, args.self_conditioning_prob)
+                row["val_loss"] = validate(model, val_loader, args.val_batches)
                 if state.best_val_loss is None or row["val_loss"] < state.best_val_loss:
                     state.best_val_loss = row["val_loss"]
             with log_path.open("a", encoding="utf-8") as f:
@@ -308,7 +337,9 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--amp", action="store_true", default=True)
+    parser.add_argument("--no-amp", dest="amp", action="store_false")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
     result = train(args)
     print(json.dumps(result, indent=2))

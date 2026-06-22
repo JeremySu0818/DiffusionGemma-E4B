@@ -162,10 +162,39 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text.encode("utf-8")) // 4)
 
 
-def read_progress(progress_path: Path) -> dict[str, Any]:
+def progress_from_output(output_path: Path) -> dict[str, Any]:
+    if not output_path.exists():
+        return {"records": 0, "estimated_tokens": 0}
+    records = 0
+    estimated_tokens = 0
+    last_record_id = None
+    for row in iter_jsonl(output_path):
+        records += 1
+        estimated_tokens += int(row.get("estimated_tokens") or 0)
+        last_record_id = row.get("id") or last_record_id
+    state: dict[str, Any] = {
+        "records": records,
+        "estimated_tokens": estimated_tokens,
+        "source_index": records,
+    }
+    if last_record_id is not None:
+        state["last_record_id"] = last_record_id
+    return state
+
+
+def read_progress(progress_path: Path, output_path: Path | None = None) -> dict[str, Any]:
+    output_state = progress_from_output(output_path) if output_path is not None else {"records": 0, "estimated_tokens": 0}
     if progress_path.exists():
-        return json.loads(progress_path.read_text(encoding="utf-8"))
-    return {"records": 0, "estimated_tokens": 0}
+        state = json.loads(progress_path.read_text(encoding="utf-8"))
+    else:
+        state = {"records": 0, "estimated_tokens": 0}
+    if (
+        output_state["records"] != int(state.get("records", 0))
+        or output_state["estimated_tokens"] != int(state.get("estimated_tokens", 0))
+    ):
+        state.update(output_state)
+        state["reconciled_from_output"] = True
+    return state
 
 
 def save_progress(progress_path: Path, state: dict[str, Any]) -> None:
@@ -190,11 +219,13 @@ def generate_records(
     prompt_records: Iterable[dict[str, Any]],
     target_estimated_tokens: int,
     progress_path: Path,
+    output_path: Path | None = None,
 ) -> Iterable[TeacherSupervisedRecord]:
     client = make_client(cfg)
-    state = read_progress(progress_path)
+    state = read_progress(progress_path, output_path=output_path)
     if state.get("records") is None:
         state["records"] = 0
+    save_progress(progress_path, state)
     for source_index, prompt_record in enumerate(prompt_records):
         if source_index < int(state.get("source_index", 0)):
             continue
@@ -274,7 +305,7 @@ def main() -> None:
             max_records_per_source=args.max_records_per_source,
             max_total_records=args.max_total_records,
         )
-    count = write_teacher_jsonl(args.output, generate_records(cfg, prompt_records, args.target_estimated_tokens, args.progress))
+    count = write_teacher_jsonl(args.output, generate_records(cfg, prompt_records, args.target_estimated_tokens, args.progress, args.output))
     print(json.dumps({"records_written": count, "output": str(args.output)}, indent=2))
 
 

@@ -7,7 +7,8 @@ import numpy as np
 
 from diffusiongemma_e4b.data_contract import TeacherSupervisedRecord, write_teacher_jsonl
 from diffusiongemma_e4b.data_sources import _prompt_record, iter_prompt_records
-from diffusiongemma_e4b.teacher import _chat_content
+from diffusiongemma_e4b.corruption import iter_jsonl_records
+from diffusiongemma_e4b.teacher import _chat_content, read_progress
 
 
 def test_corruption_shard_shape(tmp_path: Path):
@@ -103,3 +104,41 @@ def test_iter_prompt_records_honors_source_and_total_limits(tmp_path: Path):
 
     assert len(rows) == 3
     assert [row["prompt_text"] for row in rows] == ["a1", "b1", "a2"]
+
+
+def test_corruption_jsonl_shuffled_order_is_deterministic_and_not_source_order(tmp_path: Path):
+    path = tmp_path / "teacher.jsonl"
+    path.write_text(
+        "\n".join(json.dumps({"id": str(i), "text": f"record {i}"}) for i in range(12)) + "\n",
+        encoding="utf-8",
+    )
+
+    source_ids = [row["id"] for row in iter_jsonl_records(path, record_order="source", seed=7)]
+    shuffled_ids = [row["id"] for row in iter_jsonl_records(path, record_order="shuffled", seed=7)]
+    shuffled_ids_again = [row["id"] for row in iter_jsonl_records(path, record_order="shuffled", seed=7)]
+
+    assert source_ids == [str(i) for i in range(12)]
+    assert shuffled_ids == shuffled_ids_again
+    assert shuffled_ids != source_ids
+
+
+def test_teacher_progress_reconciles_from_output_jsonl(tmp_path: Path):
+    output = tmp_path / "teacher_outputs.jsonl"
+    output.write_text(
+        "\n".join(
+            json.dumps({"id": f"r{i}", "estimated_tokens": tokens})
+            for i, tokens in enumerate([5, 7], start=1)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    progress = tmp_path / "progress.json"
+    progress.write_text(json.dumps({"records": 3, "estimated_tokens": 99, "source_index": 3}), encoding="utf-8")
+
+    state = read_progress(progress, output_path=output)
+
+    assert state["records"] == 2
+    assert state["estimated_tokens"] == 12
+    assert state["source_index"] == 2
+    assert state["last_record_id"] == "r2"
+    assert state["reconciled_from_output"] is True

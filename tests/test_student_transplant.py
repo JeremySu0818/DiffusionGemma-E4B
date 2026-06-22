@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from diffusiongemma_e4b.student import make_transplant_state_dict
+from diffusiongemma_e4b.student import make_transplant_state_dict, validate_transplant_report
 
 
 def test_transplant_maps_text_vision_and_projection_families():
@@ -74,3 +74,38 @@ def test_transplant_reports_multimodal_shape_mismatch():
     assert report["shape_mismatch_count_by_family"]["vision_tower"] == 1
     assert report["shape_mismatch_count_by_family"]["audio_tower"] == 1
     assert {item["family"] for item in report["shape_mismatch"]} == {"vision_tower", "audio_tower"}
+
+
+def test_validate_transplant_report_rejects_partial_copy():
+    report = {
+        "missing_source_count": 1,
+        "shape_mismatch": [],
+        "load_missing": [],
+        "load_unexpected": [],
+        "image_text_target_present": False,
+        "image_text_fully_copied": False,
+        "audio_text_target_present": False,
+        "audio_text_fully_copied": False,
+    }
+
+    try:
+        validate_transplant_report(report)
+    except RuntimeError as exc:
+        assert "missing_source_count=1" in str(exc)
+    else:
+        raise AssertionError("expected partial transplant to be rejected")
+
+
+def test_validate_transplant_report_allows_clean_copy():
+    report = {
+        "missing_source_count": 0,
+        "shape_mismatch": [],
+        "load_missing": [],
+        "load_unexpected": [],
+        "image_text_target_present": True,
+        "image_text_fully_copied": True,
+        "audio_text_target_present": True,
+        "audio_text_fully_copied": True,
+    }
+
+    validate_transplant_report(report)

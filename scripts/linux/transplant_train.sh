@@ -30,5 +30,6 @@ python -m diffusiongemma_e4b.train \
   --val-interval "${DG_VAL_INTERVAL:-500}" \
   --val-batches "${DG_VAL_BATCHES:-16}" \
   --self-conditioning-prob "${DG_SELF_CONDITIONING_PROB:-0.5}" \
+  --seed "${DG_SEED:-1337}" \
   --gradient-checkpointing \
   --resume

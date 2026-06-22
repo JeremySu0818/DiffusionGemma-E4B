@@ -28,6 +28,7 @@ $maxSteps = if ($env:DG_MAX_STEPS) { $env:DG_MAX_STEPS } else { "200000" }
 $saveInterval = if ($env:DG_SAVE_INTERVAL) { $env:DG_SAVE_INTERVAL } else { "1000" }
 $valInterval = if ($env:DG_VAL_INTERVAL) { $env:DG_VAL_INTERVAL } else { "500" }
 $selfConditioningProb = if ($env:DG_SELF_CONDITIONING_PROB) { $env:DG_SELF_CONDITIONING_PROB } else { "0.5" }
+$seed = if ($env:DG_SEED) { $env:DG_SEED } else { "1337" }
 python -m diffusiongemma_e4b.train `
   --model-dir $transplantDir `
   --data-dir $dataDir `
@@ -40,5 +41,6 @@ python -m diffusiongemma_e4b.train `
   --save-interval $saveInterval `
   --val-interval $valInterval `
   --self-conditioning-prob $selfConditioningProb `
+  --seed $seed `
   --gradient-checkpointing `
   --resume

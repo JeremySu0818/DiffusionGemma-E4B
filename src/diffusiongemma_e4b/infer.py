@@ -57,13 +57,19 @@ def strict_diffusion_generate(
 ) -> dict:
     device = next(model.parameters()).device
     encoder_inputs = dict(encoder_inputs or {})
+    base_attention_mask = None
     if "input_ids" in encoder_inputs:
         input_ids = encoder_inputs.pop("input_ids").to(device)
-        encoder_inputs.pop("attention_mask", None)
+        base_attention_mask = encoder_inputs.pop("attention_mask", None)
+        if base_attention_mask is not None:
+            base_attention_mask = base_attention_mask.to(device)
     else:
         input_ids = tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").to(device)
+    if base_attention_mask is None:
+        base_attention_mask = torch.ones_like(input_ids)
     encoder_inputs = {k: v.to(device) for k, v in encoder_inputs.items()}
     committed = input_ids
+    committed_attention_mask = base_attention_mask
     blocks = []
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
@@ -73,18 +79,24 @@ def strict_diffusion_generate(
     while remaining > 0:
         canvas = torch.randint(0, vocab_size, (1, canvas_length), device=device, generator=generator)
         self_conditioning_logits = None
+        encoder_past_key_values = None
         last_argmax = None
         stable = 0
         trace = []
         for step in range(denoise_steps):
-            out = model(
-                input_ids=committed,
-                attention_mask=torch.ones_like(committed),
-                decoder_input_ids=canvas,
-                self_conditioning_logits=self_conditioning_logits,
+            model_kwargs = {
+                "decoder_input_ids": canvas,
+                "self_conditioning_logits": self_conditioning_logits,
                 **encoder_inputs,
-            )
+            }
+            if encoder_past_key_values is None:
+                model_kwargs["input_ids"] = committed
+                model_kwargs["attention_mask"] = committed_attention_mask
+            else:
+                model_kwargs["past_key_values"] = encoder_past_key_values
+            out = model(**model_kwargs)
             logits = out.logits
+            encoder_past_key_values = out.past_key_values
             canvas, argmax_canvas, entropy = entropy_bound_step(
                 logits, canvas, entropy_bound, temperature, vocab_size, generator
             )
@@ -101,6 +113,10 @@ def strict_diffusion_generate(
                 break
         commit = last_argmax[:, : min(canvas_length, remaining)]
         committed = torch.cat([committed, commit], dim=1)
+        committed_attention_mask = torch.cat(
+            [committed_attention_mask, torch.ones((committed_attention_mask.shape[0], commit.shape[1]), dtype=committed_attention_mask.dtype, device=device)],
+            dim=1,
+        )
         blocks.append({"tokens": int(commit.numel()), "steps": len(trace), "trace": trace})
         remaining -= int(commit.numel())
     new_ids = committed[:, input_ids.shape[1] :]

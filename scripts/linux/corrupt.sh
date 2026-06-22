@@ -14,4 +14,6 @@ python -m diffusiongemma_e4b.corruption \
   --target-blocks "${DG_TARGET_BLOCKS:-200000}" \
   --canvas-length "${DG_CANVAS_LENGTH:-256}" \
   --prefix-length "${DG_PREFIX_LENGTH:-512}" \
-  --shard-blocks "${DG_SHARD_BLOCKS:-4096}"
+  --shard-blocks "${DG_SHARD_BLOCKS:-4096}" \
+  --seed "${DG_SEED:-1337}" \
+  --record-order "${DG_RECORD_ORDER:-shuffled}"

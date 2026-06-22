@@ -22,10 +22,6 @@ MULTIMODAL_SHARD_KEYS = (
 )
 
 
-def _block_slices(total_tokens: int, canvas_length: int) -> int:
-    return total_tokens // canvas_length
-
-
 def _noise_block(target: np.ndarray, vocab_size: int, pad_token_id: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, float]:
     t = float(rng.uniform(0.05, 0.95))
     label_mask = target >= 0
@@ -200,6 +196,33 @@ def _write_shard(output_dir: Path, family: str, shard_id: int, examples: list[di
     return shard_path
 
 
+def _jsonl_offsets(path: Path) -> list[int]:
+    offsets: list[int] = []
+    with path.open("rb") as f:
+        while True:
+            offset = f.tell()
+            line = f.readline()
+            if not line:
+                break
+            if line.strip():
+                offsets.append(offset)
+    return offsets
+
+
+def iter_jsonl_records(path: Path, record_order: str, seed: int) -> Iterable[dict[str, Any]]:
+    if record_order == "source":
+        yield from iter_jsonl(path)
+        return
+
+    offsets = _jsonl_offsets(path)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(offsets)
+    with path.open("rb") as f:
+        for offset in offsets:
+            f.seek(offset)
+            yield json.loads(f.readline().decode("utf-8"))
+
+
 def build_shards(
     raw_jsonl: Path,
     output_dir: Path,
@@ -209,6 +232,7 @@ def build_shards(
     prefix_length: int = DEFAULT_PREFIX_LENGTH,
     shard_blocks: int = 4096,
     seed: int = 1337,
+    record_order: str = "shuffled",
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     progress_path = output_dir / "corruption_progress.json"
@@ -232,7 +256,7 @@ def build_shards(
         shard_ids[family] = shard_id + 1
         buffers[sig] = []
 
-    for record in iter_jsonl(raw_jsonl):
+    for record in iter_jsonl_records(raw_jsonl, record_order=record_order, seed=seed):
         if blocks_written >= target_blocks:
             break
         records_read += 1
@@ -270,6 +294,8 @@ def build_shards(
         "prefix_length": prefix_length,
         "tokenizer": tokenizer_name_or_path,
         "shard_families": shard_ids,
+        "record_order": record_order,
+        "seed": seed,
     }
     progress_path.write_text(json.dumps(progress, indent=2), encoding="utf-8")
     return progress
@@ -304,6 +330,7 @@ def main() -> None:
     parser.add_argument("--prefix-length", type=int, default=DEFAULT_PREFIX_LENGTH)
     parser.add_argument("--shard-blocks", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--record-order", choices=["shuffled", "source"], default="shuffled")
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
 
@@ -319,6 +346,7 @@ def main() -> None:
             args.prefix_length,
             args.shard_blocks,
             args.seed,
+            args.record_order,
         )
     print(json.dumps(result, indent=2))
 

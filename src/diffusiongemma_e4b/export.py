@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import shutil
 import tarfile
 from pathlib import Path
 

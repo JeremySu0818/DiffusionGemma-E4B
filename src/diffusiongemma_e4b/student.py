@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Iterable
 
 import torch
 import transformers
@@ -206,6 +205,31 @@ def load_base_model(model_id_or_path: str, dtype: str, device_map: str | None):
     raise RuntimeError("Could not load base Gemma 4 E4B model:\n" + "\n".join(errors))
 
 
+def validate_transplant_report(report: dict, allow_partial: bool = False) -> None:
+    if allow_partial:
+        return
+    problems = []
+    if report.get("missing_source_count", 0) > 0:
+        problems.append(f"missing_source_count={report['missing_source_count']}")
+    if report.get("shape_mismatch"):
+        problems.append(f"shape_mismatch_count={len(report['shape_mismatch'])}")
+    if report.get("load_missing"):
+        problems.append(f"load_missing_count={len(report['load_missing'])}")
+    if report.get("load_unexpected"):
+        problems.append(f"load_unexpected_count={len(report['load_unexpected'])}")
+    if report.get("image_text_target_present") and not report.get("image_text_fully_copied"):
+        problems.append("image_text_partial_copy")
+    if report.get("audio_text_target_present") and not report.get("audio_text_fully_copied"):
+        problems.append("audio_text_partial_copy")
+    if problems:
+        raise RuntimeError(
+            "Weight transplant coverage is incomplete; refusing to continue. "
+            + "Problems: "
+            + ", ".join(problems)
+            + ". Inspect weight_transplant_report.json or rerun with --allow-partial-transplant only if this is intentional."
+        )
+
+
 def transplant_weights(
     base_model: str,
     output_dir: Path,
@@ -213,6 +237,7 @@ def transplant_weights(
     dtype: str = "bfloat16",
     device_map: str | None = "auto",
     save_full_model: bool = True,
+    allow_partial_transplant: bool = False,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     student = create_diffusion_e4b_model(base_model, canvas_length, dtype)
@@ -228,6 +253,7 @@ def transplant_weights(
     report["dtype"] = dtype
     report_path = output_dir / "weight_transplant_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    validate_transplant_report(report, allow_partial=allow_partial_transplant)
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
     tokenizer.save_pretrained(output_dir)
@@ -251,6 +277,7 @@ def main() -> None:
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--no-save-full-model", action="store_true")
+    parser.add_argument("--allow-partial-transplant", action="store_true")
     args = parser.parse_args()
     report = transplant_weights(
         args.base_model,
@@ -259,6 +286,7 @@ def main() -> None:
         args.dtype,
         None if args.device_map == "none" else args.device_map,
         save_full_model=not args.no_save_full_model,
+        allow_partial_transplant=args.allow_partial_transplant,
     )
     print(
         json.dumps(

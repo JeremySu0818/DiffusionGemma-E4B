@@ -10,6 +10,8 @@ $targetBlocks = if ($env:DG_TARGET_BLOCKS) { $env:DG_TARGET_BLOCKS } else { "200
 $canvasLength = if ($env:DG_CANVAS_LENGTH) { $env:DG_CANVAS_LENGTH } else { "256" }
 $prefixLength = if ($env:DG_PREFIX_LENGTH) { $env:DG_PREFIX_LENGTH } else { "512" }
 $shardBlocks = if ($env:DG_SHARD_BLOCKS) { $env:DG_SHARD_BLOCKS } else { "4096" }
+$seed = if ($env:DG_SEED) { $env:DG_SEED } else { "1337" }
+$recordOrder = if ($env:DG_RECORD_ORDER) { $env:DG_RECORD_ORDER } else { "shuffled" }
 python -m diffusiongemma_e4b.corruption `
   --raw-jsonl data/teacher_supervised/teacher_outputs.jsonl `
   --output-dir data/corruption `
@@ -17,4 +19,6 @@ python -m diffusiongemma_e4b.corruption `
   --target-blocks $targetBlocks `
   --canvas-length $canvasLength `
   --prefix-length $prefixLength `
-  --shard-blocks $shardBlocks
+  --shard-blocks $shardBlocks `
+  --seed $seed `
+  --record-order $recordOrder
