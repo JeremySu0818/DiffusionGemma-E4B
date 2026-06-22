@@ -27,6 +27,7 @@ then
     --model "$MODEL" \
     --host "$HOST" \
     --port "$PORT" \
+    --gpu-memory-utilization 0.75 \
     --trust-remote-code
 fi
 
