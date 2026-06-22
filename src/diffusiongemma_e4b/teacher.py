@@ -198,7 +198,7 @@ def generate_records(
     for source_index, prompt_record in enumerate(prompt_records):
         if source_index < int(state.get("source_index", 0)):
             continue
-        if state["estimated_tokens"] >= target_estimated_tokens:
+        if target_estimated_tokens > 0 and state["estimated_tokens"] >= target_estimated_tokens:
             break
         started = time.time()
         prompt = _build_prompt(prompt_record)
@@ -238,9 +238,11 @@ def main() -> None:
     parser.add_argument("--media-dir", type=Path, default=Path("data/media_cache"))
     parser.add_argument("--max-prompt-chars", type=int, default=12000)
     parser.add_argument("--sources", default="")
+    parser.add_argument("--max-records-per-source", type=int, default=0)
+    parser.add_argument("--max-total-records", type=int, default=0)
     parser.add_argument("--output", type=Path, default=Path("data/teacher_supervised/teacher_outputs.jsonl"))
     parser.add_argument("--progress", type=Path, default=Path("data/teacher_supervised/progress.json"))
-    parser.add_argument("--target-estimated-tokens", type=int, default=50_000_000)
+    parser.add_argument("--target-estimated-tokens", type=int, default=0)
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.95)
     parser.add_argument("--top-p", type=float, default=0.98)
@@ -269,6 +271,8 @@ def main() -> None:
             source_names=source_names,
             max_chars=args.max_prompt_chars,
             media_dir=args.media_dir,
+            max_records_per_source=args.max_records_per_source,
+            max_total_records=args.max_total_records,
         )
     count = write_teacher_jsonl(args.output, generate_records(cfg, prompt_records, args.target_estimated_tokens, args.progress))
     print(json.dumps({"records_written": count, "output": str(args.output)}, indent=2))

@@ -14,7 +14,9 @@ $sourceConfig = if ($env:DG_DATASET_CONFIG) { $env:DG_DATASET_CONFIG } else { "c
 $mediaDir = if ($env:DG_MEDIA_CACHE_DIR) { $env:DG_MEDIA_CACHE_DIR } else { "data/media_cache" }
 $maxPromptChars = if ($env:DG_MAX_PROMPT_CHARS) { $env:DG_MAX_PROMPT_CHARS } else { "12000" }
 $sources = if ($env:DG_DATASET_SOURCES) { $env:DG_DATASET_SOURCES } else { "" }
-$targetTokens = if ($env:DG_TARGET_ESTIMATED_TOKENS) { $env:DG_TARGET_ESTIMATED_TOKENS } else { "50000000" }
+$maxPerSource = if ($env:DG_MAX_RECORDS_PER_SOURCE) { $env:DG_MAX_RECORDS_PER_SOURCE } else { "0" }
+$maxTotal = if ($env:DG_MAX_TOTAL_PROMPT_RECORDS) { $env:DG_MAX_TOTAL_PROMPT_RECORDS } else { "0" }
+$targetTokens = if ($env:DG_TARGET_ESTIMATED_TOKENS) { $env:DG_TARGET_ESTIMATED_TOKENS } else { "0" }
 $maxTokens = if ($env:DG_MAX_TOKENS_PER_SAMPLE) { $env:DG_MAX_TOKENS_PER_SAMPLE } else { "4096" }
 $temperature = if ($env:DG_TEACHER_TEMPERATURE) { $env:DG_TEACHER_TEMPERATURE } else { "0.95" }
 $topP = if ($env:DG_TEACHER_TOP_P) { $env:DG_TEACHER_TOP_P } else { "0.98" }
@@ -26,6 +28,8 @@ python -m diffusiongemma_e4b.teacher `
   --media-dir $mediaDir `
   --max-prompt-chars $maxPromptChars `
   --sources $sources `
+  --max-records-per-source $maxPerSource `
+  --max-total-records $maxTotal `
   --output data/teacher_supervised/teacher_outputs.jsonl `
   --progress data/teacher_supervised/progress.json `
   --target-estimated-tokens $targetTokens `

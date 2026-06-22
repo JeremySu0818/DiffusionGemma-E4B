@@ -42,6 +42,7 @@
       "modality": "text",
       "split": "train",
       "enabled": true,
+      "max_records": 10000,
       "streaming": true,
       "license_hint": "dataset card terms"
     },
@@ -52,6 +53,7 @@
       "modality": "text",
       "split": "train",
       "enabled": true,
+      "max_records": 8000,
       "streaming": true,
       "license_hint": "requires Hugging Face access/terms"
     },
@@ -62,6 +64,7 @@
       "modality": "text",
       "split": "train",
       "enabled": true,
+      "max_records": 8000,
       "streaming": true,
       "license_hint": "dataset card terms"
     },
@@ -72,6 +75,7 @@
       "modality": "text",
       "split": "train",
       "enabled": true,
+      "max_records": 8000,
       "streaming": true,
       "license_hint": "large dataset; enable on cloud after access approval"
     },
@@ -82,6 +86,7 @@
       "modality": "text",
       "split": "train_sft",
       "enabled": true,
+      "max_records": 8000,
       "streaming": true,
       "license_hint": "use prompts only"
     },
@@ -92,6 +97,7 @@
       "modality": "text",
       "split": "train",
       "enabled": true,
+      "max_records": 8000,
       "streaming": true,
       "license_hint": "mixed subsets; use prompts only"
     },
@@ -102,6 +108,7 @@
       "modality": "text",
       "split": "train",
       "enabled": true,
+      "max_records": 6000,
       "streaming": true,
       "license_hint": "dataset card terms"
     },
@@ -112,6 +119,7 @@
       "modality": "text",
       "split": "train",
       "enabled": true,
+      "max_records": 6000,
       "streaming": true,
       "license_hint": "large; enable when storage/network budget is available"
     },
@@ -122,6 +130,7 @@
       "modality": "text",
       "split": "train",
       "enabled": true,
+      "max_records": 6000,
       "streaming": true,
       "license_hint": "large; enable when storage/network budget is available"
     },
@@ -132,6 +141,7 @@
       "modality": "code",
       "split": "train",
       "enabled": true,
+      "max_records": 5000,
       "streaming": true,
       "license_hint": "preserve license/provenance metadata"
     },
@@ -142,6 +152,7 @@
       "modality": "image_text_interleaved",
       "split": "train",
       "enabled": true,
+      "max_records": 2500,
       "streaming": true,
       "license_hint": "very large; enable on cloud"
     },
@@ -152,6 +163,7 @@
       "modality": "image_text_interleaved",
       "split": "train",
       "enabled": true,
+      "max_records": 2500,
       "streaming": true,
       "license_hint": "large; dataset card terms"
     },
@@ -162,6 +174,7 @@
       "modality": "image",
       "split": "train",
       "enabled": true,
+      "max_records": 2500,
       "streaming": true,
       "license_hint": "use image/prompt/context only"
     },
@@ -172,6 +185,7 @@
       "modality": "image",
       "split": "train",
       "enabled": true,
+      "max_records": 2000,
       "streaming": true,
       "license_hint": "document/image QA context"
     },
@@ -182,6 +196,7 @@
       "modality": "image",
       "split": "train",
       "enabled": true,
+      "max_records": 2000,
       "streaming": true,
       "license_hint": "chart/image QA context"
     },
@@ -192,6 +207,7 @@
       "modality": "image",
       "split": "train",
       "enabled": true,
+      "max_records": 2000,
       "streaming": true,
       "license_hint": "science/diagram context"
     },
@@ -201,6 +217,7 @@
       "role": "speech_audio_context",
       "modality": "audio",
       "enabled": true,
+      "max_records": 1000,
       "streaming": true,
       "license_hint": "speech dataset; select language config explicitly if needed"
     },
@@ -210,6 +227,7 @@
       "role": "speech_audio_context",
       "modality": "audio",
       "enabled": true,
+      "max_records": 1000,
       "streaming": true,
       "license_hint": "large speech dataset"
     },
@@ -219,6 +237,7 @@
       "role": "general_audio_context",
       "modality": "audio",
       "enabled": true,
+      "max_records": 1000,
       "manifest_only": true,
       "license_hint": "audio labels; use media manifest path"
     },
@@ -228,6 +247,7 @@
       "role": "audio_caption_context",
       "modality": "audio",
       "enabled": true,
+      "max_records": 1000,
       "streaming": true,
       "license_hint": "audio caption context"
     }

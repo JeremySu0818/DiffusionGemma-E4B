@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from diffusiongemma_e4b.data_contract import TeacherSupervisedRecord, write_teacher_jsonl
-from diffusiongemma_e4b.data_sources import _prompt_record
+from diffusiongemma_e4b.data_sources import _prompt_record, iter_prompt_records
 from diffusiongemma_e4b.teacher import _chat_content
 
 
@@ -78,3 +78,28 @@ def test_teacher_chat_content_includes_image_media(tmp_path: Path):
     assert content[0] == {"type": "text", "text": "describe this"}
     assert content[1]["type"] == "image_url"
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_iter_prompt_records_honors_source_and_total_limits(tmp_path: Path):
+    manifest_a = tmp_path / "a.jsonl"
+    manifest_b = tmp_path / "b.jsonl"
+    manifest_a.write_text(
+        "\n".join(json.dumps({"prompt": prompt}) for prompt in ("a1", "a2", "a3")) + "\n",
+        encoding="utf-8",
+    )
+    manifest_b.write_text(
+        "\n".join(json.dumps({"prompt": prompt}) for prompt in ("b1", "b2", "b3")) + "\n",
+        encoding="utf-8",
+    )
+
+    config = {
+        "sources": [
+            {"id": "a", "name": "a", "role": "prompt_context_bank", "modality": "text", "manifest_only": True, "manifest_path": str(manifest_a), "max_records": 2},
+            {"id": "b", "name": "b", "role": "prompt_context_bank", "modality": "text", "manifest_only": True, "manifest_path": str(manifest_b), "max_records": 2},
+        ]
+    }
+
+    rows = list(iter_prompt_records(config, source_names=None, max_chars=100, media_dir=tmp_path, max_total_records=3))
+
+    assert len(rows) == 3
+    assert [row["prompt_text"] for row in rows] == ["a1", "b1", "a2"]

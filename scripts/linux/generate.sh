@@ -34,9 +34,11 @@ python -m diffusiongemma_e4b.teacher \
   --media-dir "${DG_MEDIA_CACHE_DIR:-data/media_cache}" \
   --max-prompt-chars "${DG_MAX_PROMPT_CHARS:-12000}" \
   --sources "${DG_DATASET_SOURCES:-}" \
+  --max-records-per-source "${DG_MAX_RECORDS_PER_SOURCE:-0}" \
+  --max-total-records "${DG_MAX_TOTAL_PROMPT_RECORDS:-0}" \
   --output data/teacher_supervised/teacher_outputs.jsonl \
   --progress data/teacher_supervised/progress.json \
-  --target-estimated-tokens "${DG_TARGET_ESTIMATED_TOKENS:-50000000}" \
+  --target-estimated-tokens "${DG_TARGET_ESTIMATED_TOKENS:-0}" \
   --max-tokens-per-sample "${DG_MAX_TOKENS_PER_SAMPLE:-4096}" \
   --temperature "${DG_TEACHER_TEMPERATURE:-0.95}" \
   --top-p "${DG_TEACHER_TOP_P:-0.98}" \

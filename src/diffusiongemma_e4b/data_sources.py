@@ -245,6 +245,8 @@ def iter_prompt_records(
     source_names: set[str] | None,
     max_chars: int,
     media_dir: Path | None,
+    max_records_per_source: int = 0,
+    max_total_records: int = 0,
 ) -> Iterable[dict[str, Any]]:
     sources = [src for src in config["sources"] if src.get("enabled", True)]
     if source_names:
@@ -256,7 +258,8 @@ def iter_prompt_records(
                 rows = _load_manifest_iter(source)
             else:
                 rows = _load_dataset_iter(source)
-            active.append((source, iter(rows)))
+            source_limit = int(source.get("max_records") or max_records_per_source or 0)
+            active.append((source, iter(rows), 0, source_limit))
         except Exception as exc:  # noqa: BLE001
             print(
                 json.dumps({"source_error": source.get("id"), "error": repr(exc)}, ensure_ascii=False),
@@ -265,9 +268,14 @@ def iter_prompt_records(
 
     if not active:
         raise RuntimeError("No dataset sources could be opened.")
+    total_records = 0
     while active:
         next_active = []
-        for source, rows in active:
+        for source, rows, yielded, source_limit in active:
+            if max_total_records > 0 and total_records >= max_total_records:
+                return
+            if source_limit > 0 and yielded >= source_limit:
+                continue
             try:
                 row = next(rows)
             except StopIteration:
@@ -281,7 +289,12 @@ def iter_prompt_records(
             record = _prompt_record(source, row, max_chars=max_chars, media_dir=media_dir)
             if record is not None:
                 yield record
-            next_active.append((source, rows))
+                yielded += 1
+                total_records += 1
+                if max_total_records > 0 and total_records >= max_total_records:
+                    return
+            if source_limit <= 0 or yielded < source_limit:
+                next_active.append((source, rows, yielded, source_limit))
         active = next_active
 
 
@@ -304,11 +317,20 @@ def main() -> None:
     parser.add_argument("--max-chars", type=int, default=12000)
     parser.add_argument("--media-dir", type=Path, default=Path("data/media_cache"))
     parser.add_argument("--sources", default="")
+    parser.add_argument("--max-records-per-source", type=int, default=0)
+    parser.add_argument("--max-total-records", type=int, default=0)
     args = parser.parse_args()
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
     source_names = {item.strip() for item in args.sources.split(",") if item.strip()} or None
-    rows = iter_prompt_records(config, source_names=source_names, max_chars=args.max_chars, media_dir=args.media_dir)
+    rows = iter_prompt_records(
+        config,
+        source_names=source_names,
+        max_chars=args.max_chars,
+        media_dir=args.media_dir,
+        max_records_per_source=args.max_records_per_source,
+        max_total_records=args.max_total_records,
+    )
     result = write_jsonl(args.output, rows)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 

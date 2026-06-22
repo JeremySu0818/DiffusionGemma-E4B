@@ -8,6 +8,8 @@ $output = if ($env:DG_PROMPT_JSONL) { $env:DG_PROMPT_JSONL } else { "data/prompt
 $maxChars = if ($env:DG_MAX_PROMPT_CHARS) { $env:DG_MAX_PROMPT_CHARS } else { "12000" }
 $mediaDir = if ($env:DG_MEDIA_CACHE_DIR) { $env:DG_MEDIA_CACHE_DIR } else { "data/media_cache" }
 $sources = if ($env:DG_DATASET_SOURCES) { $env:DG_DATASET_SOURCES } else { "" }
+$maxPerSource = if ($env:DG_MAX_RECORDS_PER_SOURCE) { $env:DG_MAX_RECORDS_PER_SOURCE } else { "0" }
+$maxTotal = if ($env:DG_MAX_TOTAL_PROMPT_RECORDS) { $env:DG_MAX_TOTAL_PROMPT_RECORDS } else { "0" }
 
 $argsList = @(
   "-m", "diffusiongemma_e4b.data_sources",
@@ -15,7 +17,9 @@ $argsList = @(
   "--output", $output,
   "--max-chars", $maxChars,
   "--media-dir", $mediaDir,
-  "--sources", $sources
+  "--sources", $sources,
+  "--max-records-per-source", $maxPerSource,
+  "--max-total-records", $maxTotal
 )
 
 Write-Host "Preparing full GPU prompt/context bank..." -ForegroundColor Cyan
