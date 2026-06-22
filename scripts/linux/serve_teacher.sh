@@ -28,7 +28,7 @@ then
     --host "$HOST" \
     --port "$PORT" \
     --gpu-memory-utilization 0.75 \
-    --cpu-offload-gb 10 \
+    --enforce-eager \
     --trust-remote-code
 fi
 
