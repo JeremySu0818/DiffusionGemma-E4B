@@ -28,6 +28,7 @@ then
     --host "$HOST" \
     --port "$PORT" \
     --gpu-memory-utilization 0.75 \
+    --cpu-offload-gb 8 \
     --trust-remote-code
 fi
 
