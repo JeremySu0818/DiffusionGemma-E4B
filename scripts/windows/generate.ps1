@@ -12,14 +12,18 @@ lms load $model | Out-Host
 Write-Host "Running teacher generation pipeline..." -ForegroundColor Cyan
 $sourceConfig = if ($env:DG_DATASET_CONFIG) { $env:DG_DATASET_CONFIG } else { "configs/dataset_sources.json" }
 $mediaDir = if ($env:DG_MEDIA_CACHE_DIR) { $env:DG_MEDIA_CACHE_DIR } else { "data/media_cache" }
-$maxPromptChars = if ($env:DG_MAX_PROMPT_CHARS) { $env:DG_MAX_PROMPT_CHARS } else { "12000" }
+$maxPromptChars = if ($env:DG_MAX_PROMPT_CHARS) { $env:DG_MAX_PROMPT_CHARS } else { "11000" }
 $sources = if ($env:DG_DATASET_SOURCES) { $env:DG_DATASET_SOURCES } else { "" }
 $maxPerSource = if ($env:DG_MAX_RECORDS_PER_SOURCE) { $env:DG_MAX_RECORDS_PER_SOURCE } else { "0" }
 $maxTotal = if ($env:DG_MAX_TOTAL_PROMPT_RECORDS) { $env:DG_MAX_TOTAL_PROMPT_RECORDS } else { "0" }
 $targetTokens = if ($env:DG_TARGET_ESTIMATED_TOKENS) { $env:DG_TARGET_ESTIMATED_TOKENS } else { "0" }
 $maxTokens = if ($env:DG_MAX_TOKENS_PER_SAMPLE) { $env:DG_MAX_TOKENS_PER_SAMPLE } else { "4096" }
-$temperature = if ($env:DG_TEACHER_TEMPERATURE) { $env:DG_TEACHER_TEMPERATURE } else { "0.95" }
-$topP = if ($env:DG_TEACHER_TOP_P) { $env:DG_TEACHER_TOP_P } else { "0.98" }
+$temperature = if ($env:DG_TEACHER_TEMPERATURE) { $env:DG_TEACHER_TEMPERATURE } else { "0.2" }
+$topP = if ($env:DG_TEACHER_TOP_P) { $env:DG_TEACHER_TOP_P } else { "0.95" }
+$teacherOutput = if ($env:DG_TEACHER_OUTPUT) { $env:DG_TEACHER_OUTPUT } else { "data/teacher_supervised/teacher_outputs.jsonl" }
+$teacherProgress = if ($env:DG_TEACHER_PROGRESS) { $env:DG_TEACHER_PROGRESS } else { "data/teacher_supervised/progress.json" }
+$concurrency = if ($env:DG_TEACHER_CONCURRENCY) { $env:DG_TEACHER_CONCURRENCY } else { "8" }
+$prefixLength = if ($env:DG_PREFIX_LENGTH) { $env:DG_PREFIX_LENGTH } else { "2048" }
 python -m diffusiongemma_e4b.teacher `
   --runtime lmstudio `
   --model $model `
@@ -30,9 +34,12 @@ python -m diffusiongemma_e4b.teacher `
   --sources $sources `
   --max-records-per-source $maxPerSource `
   --max-total-records $maxTotal `
-  --output data/teacher_supervised/teacher_outputs.jsonl `
-  --progress data/teacher_supervised/progress.json `
+  --output $teacherOutput `
+  --progress $teacherProgress `
   --target-estimated-tokens $targetTokens `
   --max-tokens-per-sample $maxTokens `
   --temperature $temperature `
-  --top-p $topP
+  --top-p $topP `
+  --tokenizer $model `
+  --concurrency $concurrency `
+  --student-prefix-length $prefixLength

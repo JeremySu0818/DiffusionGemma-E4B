@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$preset = "gpu"
+$preset = if ($env:DG_PRESET) { $env:DG_PRESET } else { "gpu" }
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 Set-Location $RepoRoot
 
@@ -15,3 +15,4 @@ Invoke-Expression ($presetScript -join "`n")
 & "$PSScriptRoot\generate.ps1"
 & "$PSScriptRoot\corrupt.ps1"
 & "$PSScriptRoot\transplant_train.ps1"
+& "$PSScriptRoot\validate_export.ps1"

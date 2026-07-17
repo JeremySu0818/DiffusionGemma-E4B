@@ -3,5 +3,13 @@
   "canvas_length": 256,
   "dtype": "bfloat16",
   "student_architecture": "diffusiongemma_e4b.modeling_multimodal.MultimodalDiffusionGemmaForBlockDiffusion",
-  "conversion": "Gemma 4 E4B multimodal config transplanted into DiffusionGemma block diffusion config"
+  "conversion": "Gemma 4 E4B weights transplanted into an E4B-sized block-diffusion model",
+  "production_supported": true,
+  "preserved_e4b_features": [
+    "dense_mlp",
+    "per_layer_embeddings",
+    "shared_kv",
+    "vision",
+    "audio"
+  ]
 }

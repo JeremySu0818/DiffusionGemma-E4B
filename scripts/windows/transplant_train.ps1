@@ -23,10 +23,15 @@ $trainOutputDir = if ($env:DG_TRAIN_OUTPUT_DIR) { $env:DG_TRAIN_OUTPUT_DIR } els
 $trainMode = if ($env:DG_TRAIN_MODE) { $env:DG_TRAIN_MODE } else { "lora" }
 $batchSize = if ($env:DG_BATCH_SIZE) { $env:DG_BATCH_SIZE } else { "1" }
 $gradAccum = if ($env:DG_GRAD_ACCUM) { $env:DG_GRAD_ACCUM } else { "32" }
-$lr = if ($env:DG_LR) { $env:DG_LR } else { "2e-4" }
-$maxSteps = if ($env:DG_MAX_STEPS) { $env:DG_MAX_STEPS } else { "200000" }
+$lr = if ($env:DG_LR) { $env:DG_LR } else { "1e-4" }
+$maxSteps = if ($env:DG_MAX_OPTIMIZER_STEPS) { $env:DG_MAX_OPTIMIZER_STEPS } else { "13000" }
 $saveInterval = if ($env:DG_SAVE_INTERVAL) { $env:DG_SAVE_INTERVAL } else { "1000" }
 $valInterval = if ($env:DG_VAL_INTERVAL) { $env:DG_VAL_INTERVAL } else { "500" }
+$valBatches = if ($env:DG_VAL_BATCHES) { $env:DG_VAL_BATCHES } else { "128" }
+$minImprovement = if ($env:DG_MIN_RELATIVE_VAL_IMPROVEMENT) { $env:DG_MIN_RELATIVE_VAL_IMPROVEMENT } else { "0.005" }
+$warmupSteps = if ($env:DG_WARMUP_STEPS) { $env:DG_WARMUP_STEPS } else { "390" }
+$loraR = if ($env:DG_LORA_R) { $env:DG_LORA_R } else { "64" }
+$loraAlpha = if ($env:DG_LORA_ALPHA) { $env:DG_LORA_ALPHA } else { "128" }
 $selfConditioningProb = if ($env:DG_SELF_CONDITIONING_PROB) { $env:DG_SELF_CONDITIONING_PROB } else { "0.5" }
 $seed = if ($env:DG_SEED) { $env:DG_SEED } else { "1337" }
 python -m diffusiongemma_e4b.train `
@@ -37,10 +42,14 @@ python -m diffusiongemma_e4b.train `
   --batch-size $batchSize `
   --gradient-accumulation-steps $gradAccum `
   --learning-rate $lr `
-  --max-steps $maxSteps `
+  --max-optimizer-steps $maxSteps `
+  --warmup-steps $warmupSteps `
   --save-interval $saveInterval `
   --val-interval $valInterval `
+  --val-batches $valBatches `
+  --min-relative-val-improvement $minImprovement `
+  --lora-r $loraR `
+  --lora-alpha $loraAlpha `
   --self-conditioning-prob $selfConditioningProb `
   --seed $seed `
-  --gradient-checkpointing `
   --resume

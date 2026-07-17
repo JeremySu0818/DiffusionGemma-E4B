@@ -1,43 +1,83 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Make sure apt-get commands are run as root if needed
-if [ "$EUID" -ne 0 ]; then
-  echo "Please run as root (using sudo) to install system packages, or ensure you have the required packages pre-installed."
-else
-  apt-get update
-  apt-get install -y git git-lfs curl wget tmux htop nvtop aria2 rsync python3.11 python3.11-venv python3.11-dev build-essential
-  git lfs install
-fi
-
-# Locate repository directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_DIR"
 
-# Automatically install uv if not present
-if ! command -v uv &> /dev/null; then
-  echo "uv is not installed. Installing uv..."
-  if command -v curl &> /dev/null; then
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
-  elif command -v wget &> /dev/null; then
-    wget -qO- https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
-  else
-    python3.11 -m pip install --user uv || python3 -m pip install --user uv || pip install --user uv
-    export PATH="$HOME/.local/bin:$PATH"
-  fi
+if [[ "${EUID}" -eq 0 && "${DG_SKIP_APT:-0}" != "1" ]]; then
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential git git-lfs curl ca-certificates tmux htop nvtop aria2 rsync \
+    python3 python3-venv python3-dev
+  git lfs install
+else
+  echo "Skipping apt packages; expecting Python, build tools, git-lfs, and CUDA drivers to be present."
 fi
 
-# Ensure uv is in PATH
-export PATH="$HOME/.local/bin:$PATH"
+if ! command -v uv >/dev/null 2>&1; then
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "uv is missing and curl is unavailable. Install uv first: https://docs.astral.sh/uv/" >&2
+    exit 1
+  fi
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
 
-echo "Setting up virtual environment in $REPO_DIR..."
-uv venv .venv --python python3.11
+export PATH="$HOME/.local/bin:$PATH"
+PYTHON_BIN="${DG_PYTHON:-python3}"
+if [[ ! -x .venv/bin/python ]]; then
+  uv venv .venv --python "$PYTHON_BIN"
+fi
 source .venv/bin/activate
-uv pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
-uv pip install -e .[train,dev]
-uv pip install vllm || true
-uv pip install flash-attn --no-build-isolation || true
-python -m diffusiongemma_e4b.config --base-model google/gemma-4-E4B-it --output-dir configs/diffusiongemma-e4b
+
+# vLLM pins a compatible CUDA-enabled torch build. Let it establish that stack
+# when this machine will host the local teacher; otherwise install PyTorch from
+# the configurable CUDA wheel index.
+TORCH_BACKEND="${DG_TORCH_BACKEND:-auto}"
+if [[ "${DG_SKIP_LOCAL_TEACHER:-0}" != "1" ]]; then
+  # Resolve vLLM and this project in one transaction so a later install cannot
+  # silently replace vLLM's compiled-against torch/transformers stack.
+  uv pip install --torch-backend="$TORCH_BACKEND" "vllm==0.23.0" -e '.[train,dev]'
+else
+  if [[ -n "${DG_TORCH_INDEX_URL:-}" ]]; then
+    uv pip install --index-url "$DG_TORCH_INDEX_URL" \
+      "torch==2.11.*" "torchvision==0.26.*" "torchaudio==2.11.*" -e '.[train,dev]'
+  else
+    uv pip install --torch-backend="$TORCH_BACKEND" \
+      "torchaudio==2.11.*" -e '.[train,dev]'
+  fi
+fi
+uv pip check
+
+if [[ "${DG_INSTALL_FLASH_ATTN:-0}" == "1" ]]; then
+  uv pip install flash-attn --no-build-isolation
+fi
+
+python - <<'PY'
+import sys
+import torch
+import transformers
+
+required = (3, 11)
+if sys.version_info < required:
+    raise SystemExit(f"Python {required[0]}.{required[1]}+ is required")
+if not hasattr(transformers, "DiffusionGemmaForBlockDiffusion"):
+    raise SystemExit(
+        "This Transformers build lacks DiffusionGemmaForBlockDiffusion. "
+        "Install the version constrained by pyproject.toml."
+    )
+if not hasattr(transformers, "AutoModelForMultimodalLM"):
+    raise SystemExit("This Transformers build lacks AutoModelForMultimodalLM.")
+print(
+    {
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "bf16_supported": bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
+    }
+)
+PY
+
+echo "Environment ready. Run: bash scripts/linux/run_pipeline.sh"

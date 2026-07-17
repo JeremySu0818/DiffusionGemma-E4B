@@ -12,13 +12,17 @@ $prefixLength = if ($env:DG_PREFIX_LENGTH) { $env:DG_PREFIX_LENGTH } else { "512
 $shardBlocks = if ($env:DG_SHARD_BLOCKS) { $env:DG_SHARD_BLOCKS } else { "4096" }
 $seed = if ($env:DG_SEED) { $env:DG_SEED } else { "1337" }
 $recordOrder = if ($env:DG_RECORD_ORDER) { $env:DG_RECORD_ORDER } else { "shuffled" }
+$teacherOutput = if ($env:DG_TEACHER_OUTPUT) { $env:DG_TEACHER_OUTPUT } else { "data/teacher_supervised/teacher_outputs.jsonl" }
+$corruptionDir = if ($env:DG_CORRUPTION_DIR) { $env:DG_CORRUPTION_DIR } else { "data/corruption" }
+$datasetConfig = if ($env:DG_DATASET_CONFIG) { $env:DG_DATASET_CONFIG } else { "configs/dataset_sources.json" }
 python -m diffusiongemma_e4b.corruption `
-  --raw-jsonl data/teacher_supervised/teacher_outputs.jsonl `
-  --output-dir data/corruption `
+  --raw-jsonl $teacherOutput `
+  --output-dir $corruptionDir `
   --tokenizer $model `
   --target-blocks $targetBlocks `
   --canvas-length $canvasLength `
   --prefix-length $prefixLength `
   --shard-blocks $shardBlocks `
   --seed $seed `
-  --record-order $recordOrder
+  --record-order $recordOrder `
+  --dataset-config $datasetConfig

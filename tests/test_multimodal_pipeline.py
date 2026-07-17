@@ -7,7 +7,7 @@ from diffusiongemma_e4b.config import build_diffusion_e4b_config
 from diffusiongemma_e4b.train import CorruptionShardDataset, compute_loss
 
 
-def test_config_preserves_audio_fields(tmp_path):
+def test_e4b_production_config_preserves_multimodal_and_text_topology(tmp_path):
     cfg = build_diffusion_e4b_config("google/gemma-4-E4B-it")
     cfg.save_pretrained(tmp_path)
 
@@ -15,6 +15,11 @@ def test_config_preserves_audio_fields(tmp_path):
 
     assert getattr(loaded, "audio_config", None) is not None
     assert getattr(loaded, "audio_token_id", None) == 258881
+    assert loaded.text_config.hidden_size == 2560
+    assert loaded.text_config.num_hidden_layers == 42
+    assert loaded.text_config.hidden_size_per_layer_input == 256
+    assert loaded.text_config.num_kv_shared_layers == 18
+    assert loaded.text_config.enable_moe_block is False
     assert loaded.architectures == ["MultimodalDiffusionGemmaForBlockDiffusion"]
 
 
@@ -51,6 +56,7 @@ def test_compute_loss_passes_multimodal_kwargs_through_self_conditioning():
     assert loss.isfinite()
     assert len(model.calls) == 2
     for call in model.calls:
+        assert call["decoder_attention_mask"].shape == (1, 7)
         assert "pixel_values" in call
         assert "input_features" in call
         assert "input_features_mask" in call
@@ -71,6 +77,10 @@ def test_corruption_dataset_reads_multimodal_npz_fields(tmp_path):
         corrupted_ids=np.ones((2, 4), dtype=np.int64),
         corruption_masks=np.ones((2, 4), dtype=np.bool_),
         noise_t=np.array([0.1, 0.2], dtype=np.float32),
+        record_ids=np.array(["record-0", "record-1"]),
+        buckets=np.array(
+            ["teacher_supervised_image", "teacher_supervised_image"]
+        ),
         pixel_values=np.ones((2, 3, 8, 8), dtype=np.float32),
         image_position_ids=np.zeros((2, 4, 2), dtype=np.int64),
     )

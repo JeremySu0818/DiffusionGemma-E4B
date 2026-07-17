@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+
 import torch
 
-from diffusiongemma_e4b.infer import strict_diffusion_generate
+from diffusiongemma_e4b.infer import (
+    _find_bundled_base_model,
+    strict_diffusion_generate,
+)
 
 
 class FakeTokenizer:
@@ -55,7 +60,15 @@ def test_strict_diffusion_generate_preserves_and_extends_attention_mask():
     )
 
     assert torch.equal(model.calls[0]["attention_mask"], torch.tensor([[0, 0, 1, 1]], dtype=torch.long))
+    assert torch.equal(
+        model.calls[0]["decoder_attention_mask"],
+        torch.tensor([[0, 0, 1, 1, 1, 1]], dtype=torch.long),
+    )
     assert torch.equal(model.calls[1]["attention_mask"], torch.tensor([[0, 0, 1, 1, 1, 1]], dtype=torch.long))
+    assert torch.equal(
+        model.calls[1]["decoder_attention_mask"],
+        torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]], dtype=torch.long),
+    )
 
 
 def test_strict_diffusion_generate_reuses_encoder_cache_within_block():
@@ -79,4 +92,25 @@ def test_strict_diffusion_generate_reuses_encoder_cache_within_block():
     assert "input_ids" in model.calls[0]
     assert "past_key_values" not in model.calls[0]
     assert "input_ids" not in model.calls[1]
+    assert "attention_mask" not in model.calls[1]
     assert model.calls[1]["past_key_values"] == "cache-1"
+    assert model.calls[1]["decoder_attention_mask"].shape == (1, 5)
+
+
+def test_release_adapter_discovers_sibling_e4b_base(tmp_path):
+    adapter = tmp_path / "artifacts" / "final"
+    base = tmp_path / "artifacts" / "base_model"
+    adapter.mkdir(parents=True)
+    base.mkdir(parents=True)
+    (base / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": [
+                    "MultimodalDiffusionGemmaForBlockDiffusion"
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _find_bundled_base_model(adapter) == base.resolve()
