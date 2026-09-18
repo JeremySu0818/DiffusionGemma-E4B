@@ -39,7 +39,7 @@ then
   exit 1
 fi
 python -m diffusiongemma_e4b.teacher \
-  --runtime openai-compatible \
+  --runtime "${DG_TEACHER_RUNTIME:-openai-compatible}" \
   --model "${DG_TEACHER_SERVED_MODEL_NAME:-${DG_MODEL:-google/gemma-4-E4B-it}}" \
   --base-url "${DG_TEACHER_BASE_URL:-http://127.0.0.1:8000/v1}" \
   --source-config "${DG_DATASET_CONFIG:-configs/dataset_sources.json}" \
@@ -58,7 +58,7 @@ python -m diffusiongemma_e4b.teacher \
   --max-retries "${DG_TEACHER_MAX_RETRIES:-5}" \
   --retry-base-s "${DG_TEACHER_RETRY_BASE_S:-2}" \
   --min-estimated-tokens "${DG_MIN_TEACHER_ESTIMATED_TOKENS:-8}" \
-  --tokenizer "${DG_STUDENT_MODEL:-google/gemma-4-E4B-it}" \
+  --tokenizer "${DG_STUDENT_MODEL:-artifacts/tokenizer_processor_gemma4_e4b}" \
   --max-consecutive-failures "${DG_TEACHER_MAX_CONSECUTIVE_FAILURES:-20}" \
-  --concurrency "${DG_TEACHER_CONCURRENCY:-8}" \
+  --concurrency "${DG_TEACHER_CONCURRENCY:-4}" \
   --student-prefix-length "${DG_PREFIX_LENGTH:-2048}"

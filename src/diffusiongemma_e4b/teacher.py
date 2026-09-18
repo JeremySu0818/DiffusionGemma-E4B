@@ -924,16 +924,21 @@ def main() -> None:
 
     from transformers import AutoConfig, AutoTokenizer
 
-    accounting_config = AutoConfig.from_pretrained(
-        args.tokenizer, trust_remote_code=True
-    )
-    tokenizer_revision = str(
-        getattr(accounting_config, "_commit_hash", None) or ""
-    )
+    tokenizer_revision = ""
+    try:
+        accounting_config = AutoConfig.from_pretrained(
+            args.tokenizer, trust_remote_code=True
+        )
+        tokenizer_revision = str(
+            getattr(accounting_config, "_commit_hash", None) or ""
+        )
+    except Exception:
+        pass
     accounting_tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer,
         trust_remote_code=True,
         revision=tokenizer_revision or None,
+        fix_broken_tokenizers=True,
     )
 
     def exact_token_count(text: str) -> int:
