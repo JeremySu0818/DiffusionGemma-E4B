@@ -123,6 +123,35 @@ def test_slow_prompt_prefetch_does_not_block_completed_requests(tmp_path, monkey
     assert elapsed < 1
 
 
+def test_resume_activity_resets_prefetch_stall_clock(tmp_path, monkeypatch):
+    def prompt_stream():
+        yield next(_prompts(1))
+        for _ in range(2):
+            time.sleep(0.03)
+            yield next(_prompts(1))
+        time.sleep(0.03)
+        yield next(iter(list(_prompts(2))[1:]))
+
+    class Client:
+        def generate(self, prompt, media=None):
+            return f"unique answer for {prompt}"
+
+    monkeypatch.setattr(teacher, "make_client", lambda _cfg: Client())
+    monkeypatch.setattr(teacher, "_PROMPT_PREFETCH_STALL_TIMEOUT_S", 0.05)
+    records = list(
+        generate_records(
+            _cfg(2),
+            prompt_stream(),
+            0,
+            tmp_path / "progress.json",
+            data_fingerprint="unit",
+            token_counter=lambda _text: 4,
+        )
+    )
+
+    assert [record.metadata["prompt_record_id"] for record in records] == ["p0", "p1"]
+
+
 def test_concurrency_one_preserves_synchronous_execution(tmp_path, monkeypatch):
     main_thread = threading.get_ident()
     client_threads = []
@@ -239,6 +268,20 @@ def test_concurrency_does_not_change_generation_fingerprint():
 
     assert generation_fingerprint(one, "data") == generation_fingerprint(many, "data")
     assert TeacherConfig("openai-compatible", "m", "http://x", 1, 0.2, 0.95).concurrency == 8
+    assert TeacherConfig("openai-compatible", "m", "http://x", 1, 0.2, 0.95).prefetch_records == 128
+
+
+def test_prefetch_reservoir_cannot_be_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(teacher, "make_client", lambda _cfg: object())
+    with pytest.raises(ValueError, match="prefetch_records"):
+        list(
+            generate_records(
+                replace(_cfg(2), prefetch_records=0),
+                _prompts(1),
+                0,
+                tmp_path / "progress.json",
+            )
+        )
 
 
 def test_generated_mix_rejects_silently_lost_required_bucket():

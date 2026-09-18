@@ -42,6 +42,7 @@ class TeacherConfig:
     api_key: str = ""
     max_consecutive_failures: int = 20
     concurrency: int = 8
+    prefetch_records: int = 128
     student_prefix_length: int = 2048
 
 
@@ -613,7 +614,7 @@ _worker_local = threading.local()
 # must never leave the generation scheduler waiting forever with LM Studio
 # idle.  Keep this deliberately finite so the progress file and terminal say
 # which side of the pipeline is stalled.
-_PROMPT_PREFETCH_STALL_TIMEOUT_S = 60.0
+_PROMPT_PREFETCH_STALL_TIMEOUT_S = 900.0
 
 
 def _worker_generate(
@@ -655,7 +656,11 @@ def _generate_records_concurrent(
     # Dataset streaming and media preparation may block on disk or the network.
     # Keep that work off the scheduler thread so a completed teacher request can
     # be replaced immediately from this bounded, single-producer buffer.
-    prefetch_size = max(cfg.concurrency * 2, cfg.concurrency + 1)
+    # Keep a bounded RAM-only reservoir so transient streaming latency does
+    # not leave local inference slots idle.  This is intentionally independent
+    # of concurrency: four workers need more than eight ready prompts when a
+    # remote shard pauses between records.
+    prefetch_size = max(cfg.prefetch_records, cfg.concurrency + 1)
     source_queue: Queue[tuple[int, dict[str, Any]] | BaseException | object] = Queue(
         maxsize=prefetch_size
     )
@@ -702,17 +707,22 @@ def _generate_records_concurrent(
     producer.start()
     source_exhausted = False
     reached_target = False
+    last_source_activity = time.monotonic()
     pending: deque[_PendingGeneration] = deque()
     executor = ThreadPoolExecutor(max_workers=cfg.concurrency, thread_name_prefix="teacher-request")
 
     def next_source_item(wait_s: float = 0.0) -> tuple[int, dict[str, Any]] | None:
-        nonlocal source_exhausted
+        nonlocal last_source_activity, source_exhausted
         try:
             value = source_queue.get(timeout=wait_s) if wait_s > 0 else source_queue.get_nowait()
         except Empty:
             if not producer.is_alive():
                 source_exhausted = True
             return None
+        # Resume may consume many already-durable prompt IDs before reaching
+        # the first new one.  Those items prove the source is making progress
+        # and must reset the stall clock even though they are not scheduled.
+        last_source_activity = time.monotonic()
         if value is source_end:
             source_exhausted = True
             return None
@@ -751,15 +761,12 @@ def _generate_records_concurrent(
             )
 
     try:
-        source_wait_started: float | None = None
         while pending or not source_exhausted:
             fill_window()
             if not pending:
                 if source_exhausted:
                     break
-                if source_wait_started is None:
-                    source_wait_started = time.monotonic()
-                elif time.monotonic() - source_wait_started >= _PROMPT_PREFETCH_STALL_TIMEOUT_S:
+                if time.monotonic() - last_source_activity >= _PROMPT_PREFETCH_STALL_TIMEOUT_S:
                     raise RuntimeError(
                         "prompt source prefetch stalled for "
                         f"{_PROMPT_PREFETCH_STALL_TIMEOUT_S:g}s; no new prompt was available"
@@ -770,7 +777,6 @@ def _generate_records_concurrent(
                 fill_window(wait_s=0.1)
                 continue
 
-            source_wait_started = None
             item = pending[0]
             try:
                 text = item.future.result()
@@ -888,6 +894,8 @@ def generate_records(
 ) -> Iterable[TeacherSupervisedRecord]:
     if cfg.concurrency < 1:
         raise ValueError("teacher concurrency must be at least 1")
+    if cfg.prefetch_records < 1:
+        raise ValueError("teacher prefetch_records must be at least 1")
     implementation = _generate_records_sync if cfg.concurrency == 1 else _generate_records_concurrent
     yield from implementation(
         cfg,
@@ -949,6 +957,12 @@ def main() -> None:
     parser.add_argument("--api-key-env", default="DG_TEACHER_API_KEY")
     parser.add_argument("--max-consecutive-failures", type=int, default=20)
     parser.add_argument("--concurrency", type=int, default=int(os.environ.get("DG_TEACHER_CONCURRENCY", "8")))
+    parser.add_argument(
+        "--prefetch-records",
+        type=int,
+        default=int(os.environ.get("DG_TEACHER_PREFETCH_RECORDS", "128")),
+        help="Maximum number of streamed prompts buffered in RAM (default: 128).",
+    )
     parser.add_argument(
         "--student-prefix-length",
         type=int,
@@ -1085,6 +1099,7 @@ def main() -> None:
         api_key=os.environ.get(args.api_key_env, ""),
         max_consecutive_failures=args.max_consecutive_failures,
         concurrency=args.concurrency,
+        prefetch_records=args.prefetch_records,
         student_prefix_length=args.student_prefix_length,
     )
     _repair_jsonl_tail(args.output)
