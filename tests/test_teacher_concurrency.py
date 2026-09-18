@@ -93,6 +93,36 @@ def test_concurrent_generation_prefetches_prompts_and_yields_submission_order(tm
     assert all(client.owner != main_thread for client in clients)
 
 
+def test_slow_prompt_prefetch_does_not_block_completed_requests(tmp_path, monkeypatch):
+    source_block = threading.Event()
+
+    def prompt_stream():
+        yield from _prompts(2)
+        source_block.wait()
+
+    class Client:
+        def generate(self, prompt, media=None):
+            return f"unique answer for {prompt}"
+
+    monkeypatch.setattr(teacher, "make_client", lambda _cfg: Client())
+    records = generate_records(
+        _cfg(2),
+        prompt_stream(),
+        0,
+        tmp_path / "progress.json",
+        data_fingerprint="unit",
+        token_counter=lambda _text: 4,
+    )
+    started = time.monotonic()
+    first = next(records)
+    second = next(records)
+    elapsed = time.monotonic() - started
+    records.close()
+
+    assert [first.metadata["prompt_record_id"], second.metadata["prompt_record_id"]] == ["p0", "p1"]
+    assert elapsed < 1
+
+
 def test_concurrency_one_preserves_synchronous_execution(tmp_path, monkeypatch):
     main_thread = threading.get_ident()
     client_threads = []

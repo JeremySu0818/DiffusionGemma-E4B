@@ -609,6 +609,12 @@ class _PendingGeneration:
 
 _worker_local = threading.local()
 
+# A streaming dataset can take a little while to open the next shard, but it
+# must never leave the generation scheduler waiting forever with LM Studio
+# idle.  Keep this deliberately finite so the progress file and terminal say
+# which side of the pipeline is stalled.
+_PROMPT_PREFETCH_STALL_TIMEOUT_S = 60.0
+
 
 def _worker_generate(
     cfg: TeacherConfig,
@@ -699,29 +705,29 @@ def _generate_records_concurrent(
     pending: deque[_PendingGeneration] = deque()
     executor = ThreadPoolExecutor(max_workers=cfg.concurrency, thread_name_prefix="teacher-request")
 
-    def next_source_item() -> tuple[int, dict[str, Any]] | None:
+    def next_source_item(wait_s: float = 0.0) -> tuple[int, dict[str, Any]] | None:
         nonlocal source_exhausted
-        while True:
-            try:
-                value = source_queue.get(timeout=0.1)
-            except Empty:
-                if not producer.is_alive():
-                    source_exhausted = True
-                    return None
-                continue
-            if value is source_end:
+        try:
+            value = source_queue.get(timeout=wait_s) if wait_s > 0 else source_queue.get_nowait()
+        except Empty:
+            if not producer.is_alive():
                 source_exhausted = True
-                return None
-            if isinstance(value, BaseException):
-                raise value
-            return value
+            return None
+        if value is source_end:
+            source_exhausted = True
+            return None
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
-    def fill_window() -> None:
+    def fill_window(wait_s: float = 0.0) -> None:
         nonlocal source_exhausted
         while not source_exhausted and len(pending) < cfg.concurrency:
             if target_estimated_tokens > 0 and int(state["estimated_tokens"]) >= target_estimated_tokens:
                 return
-            source_item = next_source_item()
+            # Once a request is in flight, never wait for a slow source here:
+            # doing so used to prevent completed requests from being appended.
+            source_item = next_source_item(wait_s=wait_s if not pending else 0.0)
             if source_item is None:
                 return
             source_index, prompt_record = source_item
@@ -745,8 +751,26 @@ def _generate_records_concurrent(
             )
 
     try:
-        fill_window()
-        while pending:
+        source_wait_started: float | None = None
+        while pending or not source_exhausted:
+            fill_window()
+            if not pending:
+                if source_exhausted:
+                    break
+                if source_wait_started is None:
+                    source_wait_started = time.monotonic()
+                elif time.monotonic() - source_wait_started >= _PROMPT_PREFETCH_STALL_TIMEOUT_S:
+                    raise RuntimeError(
+                        "prompt source prefetch stalled for "
+                        f"{_PROMPT_PREFETCH_STALL_TIMEOUT_S:g}s; no new prompt was available"
+                    )
+                # There is no LM request to service, so a short bounded wait
+                # is appropriate.  It is repeated only until the explicit
+                # stall timeout above, rather than forever.
+                fill_window(wait_s=0.1)
+                continue
+
+            source_wait_started = None
             item = pending[0]
             try:
                 text = item.future.result()
