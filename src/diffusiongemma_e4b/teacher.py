@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -777,15 +777,28 @@ def _generate_records_concurrent(
                 fill_window(wait_s=0.1)
                 continue
 
-            item = pending[0]
+            # Commit in completion order. Waiting only on pending[0] caused
+            # head-of-line blocking: faster responses accumulated in RAM,
+            # no slots were refilled, and four-way LM Studio concurrency
+            # eventually collapsed to one long request.
+            completed, _ = wait(
+                [candidate.future for candidate in pending],
+                return_when=FIRST_COMPLETED,
+            )
+            item = min(
+                (candidate for candidate in pending if candidate.future in completed),
+                key=lambda candidate: candidate.source_index,
+            )
             try:
                 text = item.future.result()
             except RuntimeError as exc:
-                pending.popleft()
+                pending.remove(item)
                 consecutive_failures += 1
                 state["failed_prompts"] = int(state.get("failed_prompts", 0)) + 1
                 state["consecutive_failures"] = consecutive_failures
-                state["source_index"] = item.source_index + 1
+                state["source_index"] = max(
+                    int(state.get("source_index", 0)), item.source_index + 1
+                )
                 state["last_failed_prompt_id"] = item.prompt_record_id
                 state["last_failure"] = str(exc)
                 save_progress(progress_path, state)
@@ -800,9 +813,11 @@ def _generate_records_concurrent(
             state["consecutive_failures"] = 0
             text_hash = hashlib.sha256(re.sub(r"\s+", " ", text).strip().encode("utf-8")).hexdigest()
             if text_hash in seen_text_hashes:
-                pending.popleft()
+                pending.remove(item)
                 state["filtered_records"] = int(state.get("filtered_records", 0)) + 1
-                state["source_index"] = item.source_index + 1
+                state["source_index"] = max(
+                    int(state.get("source_index", 0)), item.source_index + 1
+                )
                 state["last_filter_reason"] = "duplicate_teacher_output"
                 save_progress(progress_path, state)
                 fill_window()
@@ -849,15 +864,17 @@ def _generate_records_concurrent(
                 media={str(k): v for k, v in item.media.items()},
                 metadata=metadata,
             )
-            # Submission order is also durable output order. The caller fsyncs
-            # this record before the generator commits state and advances.
+            # Completion order is durable output order. Stable prompt IDs and
+            # source_index metadata preserve exact resume and audit identity.
             yield record
-            pending.popleft()
+            pending.remove(item)
             seen_text_hashes.add(text_hash)
             existing_prompt_ids.add(item.prompt_record_id)
             state["records"] = int(state["records"]) + 1
             state["estimated_tokens"] = int(state["estimated_tokens"]) + tok
-            state["source_index"] = item.source_index + 1
+            state["source_index"] = max(
+                int(state.get("source_index", 0)), item.source_index + 1
+            )
             state["last_record_id"] = record.id
             state["last_seconds"] = round(time.time() - item.started, 3)
             state["last_estimated_tokens"] = tok
