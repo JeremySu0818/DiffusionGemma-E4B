@@ -8,7 +8,7 @@ cd "$REPO_DIR"
 if [[ "${EUID}" -eq 0 && "${DG_SKIP_APT:-0}" != "1" ]]; then
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    build-essential git git-lfs curl ca-certificates tmux htop nvtop aria2 rsync \
+    build-essential git git-lfs curl ca-certificates tmux htop nvtop aria2 rsync jq \
     python3 python3-venv python3-dev
   git lfs install
 else

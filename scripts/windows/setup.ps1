@@ -13,8 +13,16 @@ if (!(Get-Command uv -ErrorAction SilentlyContinue)) {
     } catch {
         Write-Host "Failed to install uv via installer, trying pip..." -ForegroundColor Yellow
         python -m pip install --user uv
-        $user_site = python -c "import site; print(site.USER_BASE)"
-        $env:Path += ";$user_site\Scripts"
+    }
+}
+
+# Automatically install jq if winget is present and jq is not installed
+if (!(Get-Command jq -ErrorAction SilentlyContinue) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+    try {
+        Write-Host "Installing jq via winget..." -ForegroundColor Yellow
+        winget install --id jqlang.jq --exact --silent --accept-source-agreements --accept-package-agreements | Out-Null
+    } catch {
+        Write-Host "Optional jq installation skipped." -ForegroundColor DarkGray
     }
 }
 

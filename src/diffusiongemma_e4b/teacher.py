@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import requests
+from tqdm.auto import tqdm
 
 from .constants import DEFAULT_LMSTUDIO_BASE_URL, DEFAULT_OLLAMA_BASE_URL
 from .data_contract import TeacherSupervisedRecord, iter_jsonl
@@ -986,19 +987,66 @@ def main() -> None:
         student_prefix_length=args.student_prefix_length,
     )
     _repair_jsonl_tail(args.output)
+    initial_state = read_progress(args.progress, output_path=args.output)
+    initial_records = int(initial_state.get("records", 0))
+    initial_tokens = int(initial_state.get("estimated_tokens", 0))
+
+    if args.target_estimated_tokens > 0:
+        pbar = tqdm(
+            total=args.target_estimated_tokens,
+            initial=min(initial_tokens, args.target_estimated_tokens),
+            unit="tok",
+            unit_scale=True,
+            dynamic_ncols=True,
+            desc="Generating teacher dataset",
+        )
+    elif args.max_total_records > 0:
+        pbar = tqdm(
+            total=args.max_total_records,
+            initial=min(initial_records, args.max_total_records),
+            unit="rec",
+            dynamic_ncols=True,
+            desc="Generating teacher dataset",
+        )
+    else:
+        pbar = tqdm(
+            initial=initial_tokens,
+            unit="tok",
+            unit_scale=True,
+            dynamic_ncols=True,
+            desc="Generating teacher dataset",
+        )
+
     written = 0
-    for record in generate_records(
-        cfg,
-        prompt_records,
-        args.target_estimated_tokens,
-        args.progress,
-        args.output,
-        data_fingerprint=data_fingerprint,
-        token_counter=exact_token_count,
-        prompt_limiter=limit_prompt_to_student_context,
-    ):
-        _append_record_durable(args.output, record)
-        written += 1
+    current_tokens = initial_tokens
+    try:
+        for record in generate_records(
+            cfg,
+            prompt_records,
+            args.target_estimated_tokens,
+            args.progress,
+            args.output,
+            data_fingerprint=data_fingerprint,
+            token_counter=exact_token_count,
+            prompt_limiter=limit_prompt_to_student_context,
+        ):
+            _append_record_durable(args.output, record)
+            written += 1
+            current_tokens += record.estimated_tokens
+            if args.target_estimated_tokens > 0 or args.max_total_records == 0:
+                pbar.update(record.estimated_tokens)
+                pbar.set_postfix({
+                    "records": initial_records + written,
+                    "last_tok": record.estimated_tokens,
+                })
+            else:
+                pbar.update(1)
+                pbar.set_postfix({
+                    "tokens": f"{current_tokens:,}",
+                    "last_tok": record.estimated_tokens,
+                })
+    finally:
+        pbar.close()
     final_state = read_progress(
         args.progress,
         output_path=args.output,
