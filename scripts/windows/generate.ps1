@@ -17,7 +17,6 @@ $sources = if ($env:DG_DATASET_SOURCES) { $env:DG_DATASET_SOURCES } else { "" }
 $maxPerSource = if ($env:DG_MAX_RECORDS_PER_SOURCE) { $env:DG_MAX_RECORDS_PER_SOURCE } else { "0" }
 $maxTotal = if ($env:DG_MAX_TOTAL_PROMPT_RECORDS) { $env:DG_MAX_TOTAL_PROMPT_RECORDS } else { "0" }
 $targetTokens = if ($env:DG_TARGET_ESTIMATED_TOKENS) { $env:DG_TARGET_ESTIMATED_TOKENS } else { "0" }
-$maxTokens = if ($env:DG_MAX_TOKENS_PER_SAMPLE) { $env:DG_MAX_TOKENS_PER_SAMPLE } else { "4096" }
 $temperature = if ($env:DG_TEACHER_TEMPERATURE) { $env:DG_TEACHER_TEMPERATURE } else { "0.2" }
 $topP = if ($env:DG_TEACHER_TOP_P) { $env:DG_TEACHER_TOP_P } else { "0.95" }
 $teacherOutput = if ($env:DG_TEACHER_OUTPUT) { $env:DG_TEACHER_OUTPUT } else { "data/teacher_supervised/teacher_outputs.jsonl" }
@@ -37,7 +36,6 @@ python -m diffusiongemma_e4b.teacher `
   --output $teacherOutput `
   --progress $teacherProgress `
   --target-estimated-tokens $targetTokens `
-  --max-tokens-per-sample $maxTokens `
   --temperature $temperature `
   --top-p $topP `
   --tokenizer $model `

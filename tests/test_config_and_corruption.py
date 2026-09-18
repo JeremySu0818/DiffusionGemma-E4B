@@ -268,6 +268,29 @@ def test_openai_teacher_always_uses_chat_completions():
     assert "prompt" not in request["json"]
 
 
+def test_openai_teacher_omits_output_cap_when_not_requested():
+    cfg = TeacherConfig("openai-compatible", "teacher", "http://teacher/v1", None, 0.2, 0.95)
+    client = OpenAICompletionsClient(cfg)
+    client.session = _FakeSession()
+
+    client.generate("hello")
+
+    assert "max_tokens" not in client.session.calls[0][1]["json"]
+
+
+def test_openai_teacher_accepts_length_finished_response():
+    class LengthResponse(_FakeResponse):
+        def json(self):
+            return {"choices": [{"finish_reason": "length", "message": {"content": "A valid teacher answer."}}]}
+
+    cfg = TeacherConfig("openai-compatible", "teacher", "http://teacher/v1", 64, 0.2, 0.95)
+    client = OpenAICompletionsClient(cfg)
+    client.session = _FakeSession()
+    client.session.post = lambda _url, **_kwargs: LengthResponse()
+
+    assert client.generate("hello") == "A valid teacher answer."
+
+
 def test_teacher_progress_fingerprint_mismatch_is_fatal(tmp_path: Path):
     output = tmp_path / "teacher.jsonl"
     output.write_text(

@@ -51,7 +51,6 @@ python -m diffusiongemma_e4b.teacher \
   --output "${DG_TEACHER_OUTPUT:-data/teacher_supervised/teacher_outputs.jsonl}" \
   --progress "${DG_TEACHER_PROGRESS:-data/teacher_supervised/progress.json}" \
   --target-estimated-tokens "${DG_TARGET_ESTIMATED_TOKENS:-0}" \
-  --max-tokens-per-sample "${DG_MAX_TOKENS_PER_SAMPLE:-4096}" \
   --temperature "${DG_TEACHER_TEMPERATURE:-0.2}" \
   --top-p "${DG_TEACHER_TOP_P:-0.95}" \
   --timeout-s "${DG_TEACHER_TIMEOUT_S:-900}" \

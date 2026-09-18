@@ -42,7 +42,7 @@ def _prompts(count: int):
         }
 
 
-def test_concurrent_generation_reads_prompts_on_main_thread_and_yields_submission_order(tmp_path, monkeypatch):
+def test_concurrent_generation_prefetches_prompts_and_yields_submission_order(tmp_path, monkeypatch):
     main_thread = threading.get_ident()
     generator_read_threads: list[int] = []
     clients = []
@@ -87,7 +87,8 @@ def test_concurrent_generation_reads_prompts_on_main_thread_and_yields_submissio
     )
 
     assert [record.metadata["prompt_record_id"] for record in records] == ["p0", "p1", "p2", "p3"]
-    assert generator_read_threads and set(generator_read_threads) == {main_thread}
+    assert generator_read_threads and main_thread not in set(generator_read_threads)
+    assert len(set(generator_read_threads)) == 1
     assert len({client.owner for client in clients}) == 3
     assert all(client.owner != main_thread for client in clients)
 

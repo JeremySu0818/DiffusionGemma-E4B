@@ -14,6 +14,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from queue import Empty, Full, Queue
 from typing import Any, Callable, Iterable
 
 import requests
@@ -29,7 +30,7 @@ class TeacherConfig:
     runtime: str
     model: str
     base_url: str
-    max_tokens: int
+    max_tokens: int | None
     temperature: float
     top_p: float
     timeout_s: int = 600
@@ -55,8 +56,6 @@ def _response_text(data: Any) -> str:
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         raise ValueError("teacher response has no choices[0]")
-    if choices[0].get("finish_reason") == "length":
-        raise ValueError("teacher response was truncated at max_tokens")
     message = choices[0].get("message")
     if not isinstance(message, dict):
         raise ValueError("teacher response has no choices[0].message")
@@ -79,14 +78,15 @@ class OpenAICompletionsClient(TeacherClient):
             self.session.headers.update({"Authorization": f"Bearer {cfg.api_key}"})
 
     def generate(self, prompt: str, media: dict[str, Any] | None = None) -> str:
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.cfg.model,
             "messages": [{"role": "user", "content": _chat_content(prompt, media or {})}],
-            "max_tokens": self.cfg.max_tokens,
             "temperature": self.cfg.temperature,
             "top_p": self.cfg.top_p,
             "stream": False,
         }
+        if self.cfg.max_tokens is not None:
+            payload["max_tokens"] = self.cfg.max_tokens
         response = self.session.post(
             f"{self.cfg.base_url.rstrip('/')}/chat/completions",
             json=payload,
@@ -106,15 +106,17 @@ class OllamaGenerateClient(TeacherClient):
     def generate(self, prompt: str, media: dict[str, Any] | None = None) -> str:
         if media:
             raise RuntimeError("Ollama multimodal generation is not supported by this pipeline; use the vLLM endpoint.")
+        options: dict[str, Any] = {
+            "temperature": self.cfg.temperature,
+            "top_p": self.cfg.top_p,
+        }
+        if self.cfg.max_tokens is not None:
+            options["num_predict"] = self.cfg.max_tokens
         payload = {
             "model": self.cfg.model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "options": {
-                "num_predict": self.cfg.max_tokens,
-                "temperature": self.cfg.temperature,
-                "top_p": self.cfg.top_p,
-            },
+            "options": options,
         }
         response = self.session.post(
             f"{self.cfg.base_url.rstrip('/')}/api/chat",
@@ -195,7 +197,10 @@ def generation_fingerprint(cfg: TeacherConfig, data_fingerprint: str = "") -> st
             "runtime": cfg.runtime,
             "model": cfg.model,
             "base_url": cfg.base_url.rstrip("/"),
-            "max_tokens": cfg.max_tokens,
+            # ``None`` means no API output cap.  Keep the legacy default in
+            # the resume identity so existing 4096-cap datasets can continue
+            # without splitting a durable output file into two fingerprints.
+            "max_tokens": cfg.max_tokens if cfg.max_tokens is not None else 4096,
             "temperature": cfg.temperature,
             "top_p": cfg.top_p,
             "min_estimated_tokens": cfg.min_estimated_tokens,
@@ -641,22 +646,85 @@ def _generate_records_concurrent(
     existing_prompt_ids, seen_text_hashes = _existing_output_sets(output_path)
     scheduled_prompt_ids = set(existing_prompt_ids)
     consecutive_failures = int(state.get("consecutive_failures", 0))
-    source_items = enumerate(iter(prompt_records))
+    # Dataset streaming and media preparation may block on disk or the network.
+    # Keep that work off the scheduler thread so a completed teacher request can
+    # be replaced immediately from this bounded, single-producer buffer.
+    prefetch_size = max(cfg.concurrency * 2, cfg.concurrency + 1)
+    source_queue: Queue[tuple[int, dict[str, Any]] | BaseException | object] = Queue(
+        maxsize=prefetch_size
+    )
+    source_stop = threading.Event()
+    source_end = object()
+
+    def put_source_item(value: tuple[int, dict[str, Any]] | BaseException | object) -> bool:
+        while not source_stop.is_set():
+            try:
+                source_queue.put(value, timeout=0.1)
+                return True
+            except Full:
+                continue
+        return False
+
+    def prefetch_prompt_records() -> None:
+        # ``datasets`` uses tqdm while opening streaming shards.  That bar runs
+        # concurrently with the teacher progress bar and otherwise overwrites
+        # it in the terminal, making generation appear to have no progress.
+        try:
+            from datasets.utils.logging import disable_progress_bar
+
+            disable_progress_bar()
+        except ImportError:
+            pass
+        source_items = enumerate(iter(prompt_records))
+        try:
+            for source_item in source_items:
+                if not put_source_item(source_item):
+                    return
+        except BaseException as exc:  # Propagate source failures on the scheduler thread.
+            put_source_item(exc)
+        finally:
+            close = getattr(source_items, "close", None)
+            if callable(close):
+                close()
+            put_source_item(source_end)
+
+    producer = threading.Thread(
+        target=prefetch_prompt_records,
+        name="teacher-prompt-prefetch",
+        daemon=True,
+    )
+    producer.start()
     source_exhausted = False
     reached_target = False
     pending: deque[_PendingGeneration] = deque()
     executor = ThreadPoolExecutor(max_workers=cfg.concurrency, thread_name_prefix="teacher-request")
+
+    def next_source_item() -> tuple[int, dict[str, Any]] | None:
+        nonlocal source_exhausted
+        while True:
+            try:
+                value = source_queue.get(timeout=0.1)
+            except Empty:
+                if not producer.is_alive():
+                    source_exhausted = True
+                    return None
+                continue
+            if value is source_end:
+                source_exhausted = True
+                return None
+            if isinstance(value, BaseException):
+                raise value
+            return value
 
     def fill_window() -> None:
         nonlocal source_exhausted
         while not source_exhausted and len(pending) < cfg.concurrency:
             if target_estimated_tokens > 0 and int(state["estimated_tokens"]) >= target_estimated_tokens:
                 return
-            try:
-                source_index, prompt_record = next(source_items)
-            except StopIteration:
-                source_exhausted = True
+            source_item = next_source_item()
+            if source_item is None:
                 return
+            source_index, prompt_record = source_item
             prompt_record_id = str(prompt_record.get("id") or _sha256_json(prompt_record))
             if prompt_record_id in scheduled_prompt_ids:
                 continue
@@ -771,12 +839,11 @@ def _generate_records_concurrent(
                 break
             fill_window()
     finally:
+        source_stop.set()
         for item in pending:
             item.future.cancel()
         executor.shutdown(wait=not reached_target and not pending, cancel_futures=True)
-        close = getattr(source_items, "close", None)
-        if callable(close):
-            close()
+        producer.join(timeout=0.2)
 
     if target_estimated_tokens > 0 and int(state["estimated_tokens"]) < target_estimated_tokens:
         raise RuntimeError(
@@ -839,7 +906,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("data/teacher_supervised/teacher_outputs.jsonl"))
     parser.add_argument("--progress", type=Path, default=Path("data/teacher_supervised/progress.json"))
     parser.add_argument("--target-estimated-tokens", type=int, default=0)
-    parser.add_argument("--max-tokens-per-sample", type=int, default=2048)
+    parser.add_argument(
+        "--max-tokens-per-sample",
+        type=int,
+        default=None,
+        help="Optional teacher output cap; omit to let the runtime stop naturally.",
+    )
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--timeout-s", type=int, default=900)
