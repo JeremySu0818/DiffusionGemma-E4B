@@ -176,13 +176,58 @@ def test_iteration_failure_does_not_silently_remove_source(tmp_path, monkeypatch
     monkeypatch.setattr(data_sources, "_load_dataset_iter", broken_rows)
     config = {
         "sources": [
-            {"id": "broken", "bucket": "text", "modality": "text", "streaming": True},
+            {
+                "id": "broken",
+                "bucket": "text",
+                "modality": "text",
+                "streaming": True,
+                "required": True,
+            },
             {"id": "fallback", "bucket": "text", "modality": "text", "streaming": True},
         ]
     }
 
     with pytest.raises(SourceMixError, match="refusing to silently remove"):
         list(iter_prompt_records(config, None, 100, tmp_path, max_total_records=1))
+
+
+def test_unavailable_optional_source_is_quarantined_without_reducing_bucket_quota(
+    tmp_path, monkeypatch, capsys
+):
+    def source_rows(source, _retry_config=None):
+        if source["id"] == "gated":
+            def unavailable():
+                raise RuntimeError("access denied")
+                yield
+
+            return unavailable()
+        return iter([{"prompt": "fallback one"}, {"prompt": "fallback two"}])
+
+    monkeypatch.setattr(data_sources, "_load_dataset_iter", source_rows)
+    config = {
+        "recommended_mix": [{"bucket": "text", "share": 1.0, "required": True}],
+        "sources": [
+            {
+                "id": "gated",
+                "bucket": "text",
+                "modality": "text",
+                "streaming": True,
+                "required": False,
+            },
+            {
+                "id": "fallback",
+                "bucket": "text",
+                "modality": "text",
+                "streaming": True,
+                "required": False,
+            },
+        ],
+    }
+
+    rows = list(iter_prompt_records(config, None, 100, tmp_path, max_total_records=2))
+
+    assert [row["prompt_text"] for row in rows] == ["fallback one", "fallback two"]
+    assert "quarantining optional dataset source gated" in capsys.readouterr().err
 
 
 def test_corruption_jsonl_shuffled_order_is_deterministic_and_not_source_order(tmp_path: Path):

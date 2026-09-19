@@ -583,6 +583,26 @@ def iter_prompt_records(
                 continue
             except Exception as exc:  # noqa: BLE001
                 failures.append({"source": str(state.source.get("id")), "phase": "iterate", "error": repr(exc)})
+                # An explicitly optional source that is unavailable before its
+                # first row (for example, an unapproved gated dataset) may be
+                # quarantined without changing the configured bucket quota.
+                # Other sources in the same bucket must still satisfy it.
+                if state.rows_read == 0 and not bool(state.source.get("required", False)):
+                    source_id = str(state.source.get("id"))
+                    states.pop(cursor)
+                    if states:
+                        source_cursor[bucket] %= len(states)
+                    print(
+                        f"WARNING: quarantining optional dataset source {source_id} before its "
+                        f"first row; bucket {bucket} quota remains unchanged: {exc}",
+                        file=sys.stderr,
+                    )
+                    if not states and bucket in required_buckets:
+                        raise SourceMixError(
+                            f"optional source {source_id} is unavailable and no source remains "
+                            f"for required bucket {bucket}: {exc}"
+                        ) from exc
+                    continue
                 raise SourceMixError(
                     f"dataset source {state.source.get('id')} failed during iteration after "
                     f"{state.rows_read} rows; refusing to silently remove it from bucket {bucket}: {exc}"
