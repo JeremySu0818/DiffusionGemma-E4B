@@ -1080,6 +1080,21 @@ def main() -> None:
     )
     parser.add_argument("--api-key-env", default="DG_TEACHER_API_KEY")
     parser.add_argument("--max-consecutive-failures", type=int, default=20)
+    parser.add_argument(
+        "--stream-max-retries",
+        type=int,
+        default=int(os.environ.get("DG_STREAM_MAX_RETRIES", "8")),
+    )
+    parser.add_argument(
+        "--stream-retry-base-s",
+        type=float,
+        default=float(os.environ.get("DG_STREAM_RETRY_BASE_S", "2")),
+    )
+    parser.add_argument(
+        "--stream-retry-max-s",
+        type=float,
+        default=float(os.environ.get("DG_STREAM_RETRY_MAX_S", "60")),
+    )
     parser.add_argument("--concurrency", type=int, default=int(os.environ.get("DG_TEACHER_CONCURRENCY", "8")))
     parser.add_argument(
         "--prefetch-records",
@@ -1159,6 +1174,11 @@ def main() -> None:
             media_dir=args.media_dir,
             max_records_per_source=args.max_records_per_source,
             max_total_records=args.max_total_records,
+            streaming_retry={
+                "max_retries": args.stream_max_retries,
+                "base_s": args.stream_retry_base_s,
+                "max_s": args.stream_retry_max_s,
+            },
         )
         configured_min_tokens = int(source_config.get("teacher_output_filters", {}).get("min_estimated_tokens", 8))
 

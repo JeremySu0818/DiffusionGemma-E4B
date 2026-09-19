@@ -524,6 +524,7 @@ def iter_prompt_records(
     media_dir: Path | None,
     max_records_per_source: int = 0,
     max_total_records: int = 0,
+    streaming_retry: dict[str, Any] | None = None,
 ) -> Iterable[dict[str, Any]]:
     sources = [
         src
@@ -537,7 +538,7 @@ def iter_prompt_records(
     order, weights, required_buckets = _training_weights(config, sources)
     by_bucket: dict[str, list[_SourceState]] = {bucket: [] for bucket in order}
     failures: list[dict[str, str]] = []
-    streaming_retry = dict(config.get("streaming_retry") or {})
+    streaming_retry = dict(streaming_retry or {})
     all_states: list[_SourceState] = []
     for source in sources:
         bucket = str(source.get("bucket") or ("image" if "image" in str(source.get("modality")) else "text"))
@@ -691,6 +692,21 @@ def main() -> None:
     parser.add_argument("--sources", default="")
     parser.add_argument("--max-records-per-source", type=int, default=0)
     parser.add_argument("--max-total-records", type=int, default=0)
+    parser.add_argument(
+        "--stream-max-retries",
+        type=int,
+        default=int(os.environ.get("DG_STREAM_MAX_RETRIES", "8")),
+    )
+    parser.add_argument(
+        "--stream-retry-base-s",
+        type=float,
+        default=float(os.environ.get("DG_STREAM_RETRY_BASE_S", "2")),
+    )
+    parser.add_argument(
+        "--stream-retry-max-s",
+        type=float,
+        default=float(os.environ.get("DG_STREAM_RETRY_MAX_S", "60")),
+    )
     args = parser.parse_args()
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
@@ -702,6 +718,11 @@ def main() -> None:
         media_dir=args.media_dir,
         max_records_per_source=args.max_records_per_source,
         max_total_records=args.max_total_records,
+        streaming_retry={
+            "max_retries": args.stream_max_retries,
+            "base_s": args.stream_retry_base_s,
+            "max_s": args.stream_retry_max_s,
+        },
     )
     result = write_jsonl(args.output, rows)
     print(json.dumps(result, indent=2, ensure_ascii=False))
