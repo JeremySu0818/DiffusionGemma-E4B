@@ -640,6 +640,11 @@ class _DiskPromptQueue:
             "source_index INTEGER PRIMARY KEY, payload TEXT NOT NULL, "
             "status TEXT NOT NULL CHECK(status IN ('queued', 'inflight', 'consumed')))"
         )
+        # Older versions retained every acknowledged row as ``consumed``,
+        # causing unbounded database growth. Completed prompt identity already
+        # lives durably in teacher_outputs.jsonl, so the spool must contain
+        # queued/inflight work only.
+        self._writer.execute("DELETE FROM prompts WHERE status = 'consumed'")
         # A process may have stopped after dequeueing but before durably writing
         # its teacher output. Make those rows available again on restart.
         self._writer.execute("UPDATE prompts SET status = 'queued' WHERE status = 'inflight'")
@@ -705,7 +710,7 @@ class _DiskPromptQueue:
     def acknowledge(self, source_index: int) -> None:
         with self._condition:
             self._reader.execute(
-                "UPDATE prompts SET status = 'consumed' WHERE source_index = ?", (source_index,)
+                "DELETE FROM prompts WHERE source_index = ?", (source_index,)
             )
             self._reader.commit()
             self._condition.notify_all()

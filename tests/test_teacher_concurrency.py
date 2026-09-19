@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 from dataclasses import replace
@@ -348,6 +349,24 @@ def test_prompt_prefetch_payloads_persist_and_resume_from_disk(tmp_path):
     resumed.finish()
     resumed.close()
     assert database_path.exists()
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM prompts").fetchone()[0] == 0
+
+
+def test_prompt_spool_removes_legacy_consumed_rows_on_open(tmp_path):
+    spool_root = tmp_path / "spool"
+    stop = threading.Event()
+    queue = _DiskPromptQueue(spool_root, max_records=2, fingerprint="legacy")
+    database_path = queue.path
+    assert queue.put(1, {"id": "old"}, stop)
+    queue._writer.execute("UPDATE prompts SET status = 'consumed' WHERE source_index = 1")
+    queue._writer.commit()
+    queue.close()
+
+    reopened = _DiskPromptQueue(spool_root, max_records=2, fingerprint="legacy")
+    reopened.close()
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM prompts").fetchone()[0] == 0
 
 
 def test_generated_mix_rejects_silently_lost_required_bucket():
