@@ -616,42 +616,53 @@ _worker_local = threading.local()
 # idle.  Keep this deliberately finite so the progress file and terminal say
 # which side of the pipeline is stalled.
 _PROMPT_PREFETCH_STALL_TIMEOUT_S = 900.0
+# Wake periodically while requests are running so newly spooled prompts can
+# occupy idle teacher slots.  Without this timeout, startup could block on the
+# first request even after the producer had filled the disk spool.
+_PROMPT_SLOT_REFILL_INTERVAL_S = 0.05
 
 
 class _DiskPromptQueue:
-    """A bounded cross-thread queue whose prompt payloads live on disk."""
+    """A bounded, resumable cross-thread queue whose payloads live on disk."""
 
-    def __init__(self, directory: Path, max_records: int):
+    def __init__(self, directory: Path, max_records: int, fingerprint: str = "default"):
         directory.mkdir(parents=True, exist_ok=True)
-        self._temporary_dir = tempfile.TemporaryDirectory(
-            prefix="teacher-prompt-spool-", dir=directory
-        )
-        self.path = Path(self._temporary_dir.name) / "prompts.sqlite3"
+        safe_fingerprint = re.sub(r"[^a-zA-Z0-9_.-]", "_", fingerprint)[:64]
+        self.path = directory / f"prompts-{safe_fingerprint}.sqlite3"
         self._condition = threading.Condition()
         self._closed = False
         self._error: BaseException | None = None
         self._max_records = max_records
-        self._count = 0
         self._writer = sqlite3.connect(self.path, check_same_thread=False)
         self._reader = sqlite3.connect(self.path, check_same_thread=False)
         self._writer.execute(
-            "CREATE TABLE prompts (source_index INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS prompts ("
+            "source_index INTEGER PRIMARY KEY, payload TEXT NOT NULL, "
+            "status TEXT NOT NULL CHECK(status IN ('queued', 'inflight', 'consumed')))"
         )
+        # A process may have stopped after dequeueing but before durably writing
+        # its teacher output. Make those rows available again on restart.
+        self._writer.execute("UPDATE prompts SET status = 'queued' WHERE status = 'inflight'")
         self._writer.commit()
+
+    def _active_count(self) -> int:
+        row = self._writer.execute(
+            "SELECT COUNT(*) FROM prompts WHERE status != 'consumed'"
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def put(self, source_index: int, prompt_record: dict[str, Any], stop: threading.Event) -> bool:
         payload = json.dumps(prompt_record, ensure_ascii=False, separators=(",", ":"))
         with self._condition:
-            while self._count >= self._max_records and not stop.is_set():
+            while not stop.is_set() and self._active_count() >= self._max_records:
                 self._condition.wait(timeout=0.1)
             if stop.is_set():
                 return False
             self._writer.execute(
-                "INSERT INTO prompts(source_index, payload) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO prompts(source_index, payload, status) VALUES (?, ?, 'queued')",
                 (source_index, payload),
             )
             self._writer.commit()
-            self._count += 1
             self._condition.notify_all()
             return True
 
@@ -664,35 +675,58 @@ class _DiskPromptQueue:
     def get(self, timeout: float = 0.0) -> tuple[int, dict[str, Any]] | None:
         deadline = time.monotonic() + timeout
         with self._condition:
-            while self._count == 0 and not self._closed:
+            row = None
+            while row is None and not self._closed:
+                row = self._reader.execute(
+                    "SELECT source_index, payload FROM prompts "
+                    "WHERE status = 'queued' ORDER BY source_index LIMIT 1"
+                ).fetchone()
+                if row is not None:
+                    break
                 remaining = deadline - time.monotonic()
                 if timeout <= 0 or remaining <= 0:
                     return None
                 self._condition.wait(timeout=remaining)
-            if self._count == 0:
+            if row is None:
+                row = self._reader.execute(
+                    "SELECT source_index, payload FROM prompts "
+                    "WHERE status = 'queued' ORDER BY source_index LIMIT 1"
+                ).fetchone()
+            if row is None:
                 if self._error is not None:
                     raise self._error
                 return None
-            row = self._reader.execute(
-                "SELECT source_index, payload FROM prompts ORDER BY source_index LIMIT 1"
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("prompt spool count is inconsistent with its SQLite contents")
-            self._reader.execute("DELETE FROM prompts WHERE source_index = ?", (row[0],))
+            self._reader.execute(
+                "UPDATE prompts SET status = 'inflight' WHERE source_index = ?", (row[0],)
+            )
             self._reader.commit()
-            self._count -= 1
-            self._condition.notify_all()
         return int(row[0]), json.loads(row[1])
+
+    def acknowledge(self, source_index: int) -> None:
+        with self._condition:
+            self._reader.execute(
+                "UPDATE prompts SET status = 'consumed' WHERE source_index = ?", (source_index,)
+            )
+            self._reader.commit()
+            self._condition.notify_all()
+
+    def requeue_inflight(self) -> None:
+        with self._condition:
+            self._reader.execute("UPDATE prompts SET status = 'queued' WHERE status = 'inflight'")
+            self._reader.commit()
+            self._condition.notify_all()
 
     @property
     def exhausted(self) -> bool:
         with self._condition:
-            return self._closed and self._count == 0
+            row = self._reader.execute(
+                "SELECT 1 FROM prompts WHERE status = 'queued' LIMIT 1"
+            ).fetchone()
+            return self._closed and row is None
 
     def close(self) -> None:
         self._writer.close()
         self._reader.close()
-        self._temporary_dir.cleanup()
 
 
 def _worker_generate(
@@ -740,7 +774,9 @@ def _generate_records_concurrent(
     # remote shard pauses between records.
     prefetch_size = max(cfg.prefetch_records, cfg.concurrency + 1)
     spool_root = cfg.prefetch_dir or progress_path.parent / "prompt_spool"
-    source_queue = _DiskPromptQueue(Path(spool_root), max_records=prefetch_size)
+    source_queue = _DiskPromptQueue(
+        Path(spool_root), max_records=prefetch_size, fingerprint=fingerprint
+    )
     source_stop = threading.Event()
 
     def prefetch_prompt_records() -> None:
@@ -804,6 +840,7 @@ def _generate_records_concurrent(
             source_index, prompt_record = source_item
             prompt_record_id = str(prompt_record.get("id") or _sha256_json(prompt_record))
             if prompt_record_id in scheduled_prompt_ids:
+                source_queue.acknowledge(source_index)
                 continue
             prompt = _build_prompt(prompt_record)
             media = dict(prompt_record.get("media") or {})
@@ -844,8 +881,12 @@ def _generate_records_concurrent(
             # eventually collapsed to one long request.
             completed, _ = wait(
                 [candidate.future for candidate in pending],
+                timeout=_PROMPT_SLOT_REFILL_INTERVAL_S,
                 return_when=FIRST_COMPLETED,
             )
+            if not completed:
+                fill_window()
+                continue
             item = min(
                 (candidate for candidate in pending if candidate.future in completed),
                 key=lambda candidate: candidate.source_index,
@@ -863,6 +904,7 @@ def _generate_records_concurrent(
                 state["last_failed_prompt_id"] = item.prompt_record_id
                 state["last_failure"] = str(exc)
                 save_progress(progress_path, state)
+                source_queue.acknowledge(item.source_index)
                 if consecutive_failures >= cfg.max_consecutive_failures:
                     raise RuntimeError(
                         f"teacher failed {consecutive_failures} consecutive prompts; aborting to avoid silent underfill"
@@ -881,6 +923,7 @@ def _generate_records_concurrent(
                 )
                 state["last_filter_reason"] = "duplicate_teacher_output"
                 save_progress(progress_path, state)
+                source_queue.acknowledge(item.source_index)
                 fill_window()
                 continue
 
@@ -928,6 +971,7 @@ def _generate_records_concurrent(
             # Completion order is durable output order. Stable prompt IDs and
             # source_index metadata preserve exact resume and audit identity.
             yield record
+            source_queue.acknowledge(item.source_index)
             pending.remove(item)
             seen_text_hashes.add(text_hash)
             existing_prompt_ids.add(item.prompt_record_id)
@@ -952,6 +996,7 @@ def _generate_records_concurrent(
             item.future.cancel()
         executor.shutdown(wait=not reached_target and not pending, cancel_futures=True)
         producer.join(timeout=0.2)
+        source_queue.requeue_inflight()
         source_queue.close()
 
     if target_estimated_tokens > 0 and int(state["estimated_tokens"]) < target_estimated_tokens:
@@ -1046,7 +1091,7 @@ def main() -> None:
         "--prefetch-dir",
         type=Path,
         default=Path(os.environ.get("DG_TEACHER_PREFETCH_DIR", "data/teacher_supervised/prompt_spool")),
-        help="Directory for the temporary SQLite prompt spool.",
+        help="Directory for persistent, resumable SQLite prompt spools.",
     )
     parser.add_argument(
         "--student-prefix-length",

@@ -126,6 +126,50 @@ def test_slow_prompt_prefetch_does_not_block_completed_requests(tmp_path, monkey
     assert elapsed < 1
 
 
+def test_newly_spooled_prompts_fill_idle_slots_before_first_request_finishes(
+    tmp_path, monkeypatch
+):
+    first_request_release = threading.Event()
+    all_slots_started = threading.Event()
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    class Client:
+        def generate(self, prompt, media=None):
+            with lock:
+                calls.append(prompt)
+                if len(calls) == 3:
+                    all_slots_started.set()
+            if prompt == "prompt 0":
+                first_request_release.wait(timeout=2)
+            return f"unique answer for {prompt}"
+
+    def delayed_prompt_stream():
+        yield next(_prompts(1))
+        time.sleep(0.08)
+        yield from list(_prompts(4))[1:]
+
+    monkeypatch.setattr(teacher, "make_client", lambda _cfg: Client())
+    records = generate_records(
+        _cfg(3),
+        delayed_prompt_stream(),
+        0,
+        tmp_path / "progress.json",
+        data_fingerprint="unit",
+        token_counter=lambda _text: 4,
+    )
+
+    consumer = threading.Thread(target=lambda: list(records))
+    consumer.start()
+    try:
+        assert all_slots_started.wait(timeout=1)
+        assert len(calls) >= 3
+    finally:
+        first_request_release.set()
+        consumer.join(timeout=2)
+    assert not consumer.is_alive()
+
+
 def test_resume_activity_resets_prefetch_stall_clock(tmp_path, monkeypatch):
     def prompt_stream():
         yield next(_prompts(1))
@@ -287,19 +331,23 @@ def test_prefetch_reservoir_cannot_be_empty(tmp_path, monkeypatch):
         )
 
 
-def test_prompt_prefetch_payloads_are_spooled_to_disk_and_cleaned_up(tmp_path):
+def test_prompt_prefetch_payloads_persist_and_resume_from_disk(tmp_path):
     spool_root = tmp_path / "spool"
     stop = threading.Event()
-    queue = _DiskPromptQueue(spool_root, max_records=2)
+    queue = _DiskPromptQueue(spool_root, max_records=2, fingerprint="unit")
     database_path = queue.path
 
     assert queue.put(7, {"id": "p7", "prompt_text": "stored on disk"}, stop)
     assert database_path.is_file()
     assert queue.get() == (7, {"id": "p7", "prompt_text": "stored on disk"})
-
-    queue.finish()
     queue.close()
-    assert not database_path.exists()
+
+    resumed = _DiskPromptQueue(spool_root, max_records=2, fingerprint="unit")
+    assert resumed.get() == (7, {"id": "p7", "prompt_text": "stored on disk"})
+    resumed.acknowledge(7)
+    resumed.finish()
+    resumed.close()
+    assert database_path.exists()
 
 
 def test_generated_mix_rejects_silently_lost_required_bucket():

@@ -8,7 +8,13 @@ import numpy as np
 import pytest
 
 from diffusiongemma_e4b.data_contract import TeacherSupervisedRecord, write_teacher_jsonl
-from diffusiongemma_e4b.data_sources import SourceMixError, _prompt_record, iter_prompt_records
+from diffusiongemma_e4b import data_sources
+from diffusiongemma_e4b.data_sources import (
+    SourceMixError,
+    _ResilientDatasetIterator,
+    _prompt_record,
+    iter_prompt_records,
+)
 from diffusiongemma_e4b.corruption import (
     _chat_prefix_text,
     _target_blocks,
@@ -117,6 +123,66 @@ def test_iter_prompt_records_honors_source_and_total_limits(tmp_path: Path):
 
     assert len(rows) == 3
     assert [row["prompt_text"] for row in rows] == ["a1", "b1", "a2"]
+
+
+def test_streaming_dataset_retries_and_resumes_from_rows_read(monkeypatch):
+    rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
+    opens = 0
+    skipped: list[int] = []
+
+    class Dataset:
+        def __init__(self, values, fail_after_first=False):
+            self.values = values
+            self.fail_after_first = fail_after_first
+
+        def __iter__(self):
+            if not self.fail_after_first:
+                return iter(self.values)
+
+            def interrupted():
+                yield self.values[0]
+                raise ConnectionResetError("network interrupted")
+
+            return interrupted()
+
+        def skip(self, count):
+            skipped.append(count)
+            return Dataset(self.values[count:])
+
+    def open_dataset(_source):
+        nonlocal opens
+        opens += 1
+        return Dataset(rows, fail_after_first=opens == 1)
+
+    monkeypatch.setattr(data_sources, "_open_hf_dataset", open_dataset)
+    iterator = _ResilientDatasetIterator(
+        {"id": "unit/stream"},
+        {"max_retries": 2, "base_s": 0},
+    )
+
+    assert list(iterator) == rows
+    assert opens == 2
+    assert skipped == [1]
+
+
+def test_iteration_failure_does_not_silently_remove_source(tmp_path, monkeypatch):
+    def broken_rows(_source, _retry_config=None):
+        def rows():
+            raise RuntimeError("broken schema")
+            yield
+
+        return rows()
+
+    monkeypatch.setattr(data_sources, "_load_dataset_iter", broken_rows)
+    config = {
+        "sources": [
+            {"id": "broken", "bucket": "text", "modality": "text", "streaming": True},
+            {"id": "fallback", "bucket": "text", "modality": "text", "streaming": True},
+        ]
+    }
+
+    with pytest.raises(SourceMixError, match="refusing to silently remove"):
+        list(iter_prompt_records(config, None, 100, tmp_path, max_total_records=1))
 
 
 def test_corruption_jsonl_shuffled_order_is_deterministic_and_not_source_order(tmp_path: Path):

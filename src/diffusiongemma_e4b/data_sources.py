@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import io
 import json
 import math
 import os
 import re
+import random
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -16,6 +19,10 @@ from typing import Any, Iterable, Iterator
 
 class SourceMixError(RuntimeError):
     """Raised when the configured training mixture cannot be satisfied."""
+
+
+class SourceStreamError(SourceMixError):
+    """Raised when a dataset stream cannot recover without changing its data mix."""
 
 
 def _as_text(value: Any) -> str:
@@ -314,7 +321,7 @@ def _prompt_record(source: dict[str, Any], row: dict[str, Any], max_chars: int, 
     }
 
 
-def _load_dataset_iter(source: dict[str, Any]) -> Iterable[dict[str, Any]]:
+def _open_hf_dataset(source: dict[str, Any]) -> Any:
     try:
         from datasets import load_dataset
     except Exception as exc:  # noqa: BLE001
@@ -325,8 +332,107 @@ def _load_dataset_iter(source: dict[str, Any]) -> Iterable[dict[str, Any]]:
         "trust_remote_code": bool(source.get("trust_remote_code", False)),
     }
     config = source.get("config")
-    ds = load_dataset(source["id"], config, **kwargs) if config else load_dataset(source["id"], **kwargs)
-    return iter(ds)
+    return load_dataset(source["id"], config, **kwargs) if config else load_dataset(source["id"], **kwargs)
+
+
+def _http_status(exc: BaseException) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_transient_stream_error(exc: BaseException) -> bool:
+    status = _http_status(exc)
+    if status is not None:
+        return status == 429 or 500 <= status < 600
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in {
+            errno.ECONNABORTED,
+            errno.ECONNREFUSED,
+            errno.ECONNRESET,
+            errno.EHOSTUNREACH,
+            errno.ENETDOWN,
+            errno.ENETUNREACH,
+            errno.ETIMEDOUT,
+        }
+    name = type(exc).__name__.lower()
+    return any(token in name for token in ("connection", "timeout", "ratelimit"))
+
+
+class _ResilientDatasetIterator:
+    def __init__(self, source: dict[str, Any], retry_config: dict[str, Any] | None = None):
+        self.source = source
+        self.rows_read = 0
+        self.iterator: Iterator[dict[str, Any]] | None = None
+        retry_config = retry_config or {}
+        self.max_retries = int(retry_config.get("max_retries", 8))
+        self.retry_base_s = float(retry_config.get("base_s", 2.0))
+        self.retry_max_s = float(retry_config.get("max_s", 60.0))
+        if self.max_retries < 0 or self.retry_base_s < 0 or self.retry_max_s < 0:
+            raise ValueError("stream retry settings must be non-negative")
+
+    def __iter__(self) -> _ResilientDatasetIterator:
+        return self
+
+    def _reopen(self) -> None:
+        dataset = _open_hf_dataset(self.source)
+        if self.rows_read:
+            skip = getattr(dataset, "skip", None)
+            if not callable(skip):
+                raise SourceStreamError(
+                    f"streaming dataset {self.source['id']} cannot resume: iterator has no skip()"
+                )
+            dataset = skip(self.rows_read)
+        self.iterator = iter(dataset)
+
+    def __next__(self) -> dict[str, Any]:
+        errors: list[str] = []
+        for attempt in range(self.max_retries + 1):
+            try:
+                if self.iterator is None:
+                    self._reopen()
+                assert self.iterator is not None
+                row = next(self.iterator)
+                self.rows_read += 1
+                return row
+            except StopIteration:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if not _is_transient_stream_error(exc):
+                    raise SourceStreamError(
+                        f"streaming dataset {self.source['id']} failed permanently at row "
+                        f"{self.rows_read}: {type(exc).__name__}: {exc}"
+                    ) from exc
+                errors.append(f"attempt={attempt + 1}: {type(exc).__name__}: {exc}")
+                self.iterator = None
+                if attempt >= self.max_retries:
+                    break
+                ceiling = min(self.retry_max_s, self.retry_base_s * (2**attempt))
+                delay = random.uniform(0.5 * ceiling, ceiling) if ceiling > 0 else 0
+                print(
+                    f"streaming dataset {self.source['id']} interrupted at row {self.rows_read}; "
+                    f"retrying in {delay:.1f}s ({attempt + 1}/{self.max_retries})",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+        raise SourceStreamError(
+            f"streaming dataset {self.source['id']} exhausted {self.max_retries} retries at "
+            f"row {self.rows_read}; refusing to silently remove the source: {' | '.join(errors)}"
+        )
+
+
+def _load_dataset_iter(
+    source: dict[str, Any], retry_config: dict[str, Any] | None = None
+) -> Iterable[dict[str, Any]]:
+    if bool(source.get("streaming", True)):
+        return _ResilientDatasetIterator(source, retry_config)
+    return iter(_open_hf_dataset(source))
 
 
 def _load_manifest_iter(source: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -431,16 +537,23 @@ def iter_prompt_records(
     order, weights, required_buckets = _training_weights(config, sources)
     by_bucket: dict[str, list[_SourceState]] = {bucket: [] for bucket in order}
     failures: list[dict[str, str]] = []
+    streaming_retry = dict(config.get("streaming_retry") or {})
     all_states: list[_SourceState] = []
     for source in sources:
         bucket = str(source.get("bucket") or ("image" if "image" in str(source.get("modality")) else "text"))
         try:
-            rows = _load_manifest_iter(source) if source.get("manifest_only") else _load_dataset_iter(source)
+            rows = (
+                _load_manifest_iter(source)
+                if source.get("manifest_only")
+                else _load_dataset_iter(source, streaming_retry)
+            )
             state = _SourceState(source, iter(rows), _bounded_limit(source, max_records_per_source))
             by_bucket[bucket].append(state)
             all_states.append(state)
         except Exception as exc:  # noqa: BLE001
-            failures.append({"source": str(source.get("id")), "phase": "open", "error": repr(exc)})
+            raise SourceMixError(
+                f"failed to open dataset source {source.get('id')}; refusing to alter the configured mix: {exc}"
+            ) from exc
 
     requested_total = int(max_total_records or 0)
     quotas = _integer_quotas(requested_total, order, weights)
@@ -469,10 +582,10 @@ def iter_prompt_records(
                 continue
             except Exception as exc:  # noqa: BLE001
                 failures.append({"source": str(state.source.get("id")), "phase": "iterate", "error": repr(exc)})
-                states.pop(cursor)
-                if states:
-                    source_cursor[bucket] %= len(states)
-                continue
+                raise SourceMixError(
+                    f"dataset source {state.source.get('id')} failed during iteration after "
+                    f"{state.rows_read} rows; refusing to silently remove it from bucket {bucket}: {exc}"
+                ) from exc
             try:
                 record = _prompt_record(state.source, row, max_chars=max_chars, media_dir=media_dir)
             except Exception as exc:  # noqa: BLE001
