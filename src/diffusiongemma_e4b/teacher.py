@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import re
+import sqlite3
 import tempfile
 import threading
 import time
@@ -14,7 +15,6 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from queue import Empty, Full, Queue
 from typing import Any, Callable, Iterable
 
 import requests
@@ -43,6 +43,7 @@ class TeacherConfig:
     max_consecutive_failures: int = 20
     concurrency: int = 8
     prefetch_records: int = 128
+    prefetch_dir: Path | None = None
     student_prefix_length: int = 2048
 
 
@@ -617,6 +618,83 @@ _worker_local = threading.local()
 _PROMPT_PREFETCH_STALL_TIMEOUT_S = 900.0
 
 
+class _DiskPromptQueue:
+    """A bounded cross-thread queue whose prompt payloads live on disk."""
+
+    def __init__(self, directory: Path, max_records: int):
+        directory.mkdir(parents=True, exist_ok=True)
+        self._temporary_dir = tempfile.TemporaryDirectory(
+            prefix="teacher-prompt-spool-", dir=directory
+        )
+        self.path = Path(self._temporary_dir.name) / "prompts.sqlite3"
+        self._condition = threading.Condition()
+        self._closed = False
+        self._error: BaseException | None = None
+        self._max_records = max_records
+        self._count = 0
+        self._writer = sqlite3.connect(self.path, check_same_thread=False)
+        self._reader = sqlite3.connect(self.path, check_same_thread=False)
+        self._writer.execute(
+            "CREATE TABLE prompts (source_index INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        self._writer.commit()
+
+    def put(self, source_index: int, prompt_record: dict[str, Any], stop: threading.Event) -> bool:
+        payload = json.dumps(prompt_record, ensure_ascii=False, separators=(",", ":"))
+        with self._condition:
+            while self._count >= self._max_records and not stop.is_set():
+                self._condition.wait(timeout=0.1)
+            if stop.is_set():
+                return False
+            self._writer.execute(
+                "INSERT INTO prompts(source_index, payload) VALUES (?, ?)",
+                (source_index, payload),
+            )
+            self._writer.commit()
+            self._count += 1
+            self._condition.notify_all()
+            return True
+
+    def finish(self, error: BaseException | None = None) -> None:
+        with self._condition:
+            self._error = error
+            self._closed = True
+            self._condition.notify_all()
+
+    def get(self, timeout: float = 0.0) -> tuple[int, dict[str, Any]] | None:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._count == 0 and not self._closed:
+                remaining = deadline - time.monotonic()
+                if timeout <= 0 or remaining <= 0:
+                    return None
+                self._condition.wait(timeout=remaining)
+            if self._count == 0:
+                if self._error is not None:
+                    raise self._error
+                return None
+            row = self._reader.execute(
+                "SELECT source_index, payload FROM prompts ORDER BY source_index LIMIT 1"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("prompt spool count is inconsistent with its SQLite contents")
+            self._reader.execute("DELETE FROM prompts WHERE source_index = ?", (row[0],))
+            self._reader.commit()
+            self._count -= 1
+            self._condition.notify_all()
+        return int(row[0]), json.loads(row[1])
+
+    @property
+    def exhausted(self) -> bool:
+        with self._condition:
+            return self._closed and self._count == 0
+
+    def close(self) -> None:
+        self._writer.close()
+        self._reader.close()
+        self._temporary_dir.cleanup()
+
+
 def _worker_generate(
     cfg: TeacherConfig,
     prompt: str,
@@ -655,26 +733,15 @@ def _generate_records_concurrent(
     consecutive_failures = int(state.get("consecutive_failures", 0))
     # Dataset streaming and media preparation may block on disk or the network.
     # Keep that work off the scheduler thread so a completed teacher request can
-    # be replaced immediately from this bounded, single-producer buffer.
-    # Keep a bounded RAM-only reservoir so transient streaming latency does
+    # be replaced immediately from this bounded, single-producer disk spool.
+    # Keep a bounded on-disk reservoir so transient streaming latency does
     # not leave local inference slots idle.  This is intentionally independent
     # of concurrency: four workers need more than eight ready prompts when a
     # remote shard pauses between records.
     prefetch_size = max(cfg.prefetch_records, cfg.concurrency + 1)
-    source_queue: Queue[tuple[int, dict[str, Any]] | BaseException | object] = Queue(
-        maxsize=prefetch_size
-    )
+    spool_root = cfg.prefetch_dir or progress_path.parent / "prompt_spool"
+    source_queue = _DiskPromptQueue(Path(spool_root), max_records=prefetch_size)
     source_stop = threading.Event()
-    source_end = object()
-
-    def put_source_item(value: tuple[int, dict[str, Any]] | BaseException | object) -> bool:
-        while not source_stop.is_set():
-            try:
-                source_queue.put(value, timeout=0.1)
-                return True
-            except Full:
-                continue
-        return False
 
     def prefetch_prompt_records() -> None:
         # ``datasets`` uses tqdm while opening streaming shards.  That bar runs
@@ -687,17 +754,18 @@ def _generate_records_concurrent(
         except ImportError:
             pass
         source_items = enumerate(iter(prompt_records))
+        error: BaseException | None = None
         try:
-            for source_item in source_items:
-                if not put_source_item(source_item):
+            for source_index, prompt_record in source_items:
+                if not source_queue.put(source_index, prompt_record, source_stop):
                     return
         except BaseException as exc:  # Propagate source failures on the scheduler thread.
-            put_source_item(exc)
+            error = exc
         finally:
             close = getattr(source_items, "close", None)
             if callable(close):
                 close()
-            put_source_item(source_end)
+            source_queue.finish(error)
 
     producer = threading.Thread(
         target=prefetch_prompt_records,
@@ -713,21 +781,14 @@ def _generate_records_concurrent(
 
     def next_source_item(wait_s: float = 0.0) -> tuple[int, dict[str, Any]] | None:
         nonlocal last_source_activity, source_exhausted
-        try:
-            value = source_queue.get(timeout=wait_s) if wait_s > 0 else source_queue.get_nowait()
-        except Empty:
-            if not producer.is_alive():
-                source_exhausted = True
+        value = source_queue.get(timeout=wait_s)
+        if value is None:
+            source_exhausted = source_queue.exhausted
             return None
         # Resume may consume many already-durable prompt IDs before reaching
         # the first new one.  Those items prove the source is making progress
         # and must reset the stall clock even though they are not scheduled.
         last_source_activity = time.monotonic()
-        if value is source_end:
-            source_exhausted = True
-            return None
-        if isinstance(value, BaseException):
-            raise value
         return value
 
     def fill_window(wait_s: float = 0.0) -> None:
@@ -891,6 +952,7 @@ def _generate_records_concurrent(
             item.future.cancel()
         executor.shutdown(wait=not reached_target and not pending, cancel_futures=True)
         producer.join(timeout=0.2)
+        source_queue.close()
 
     if target_estimated_tokens > 0 and int(state["estimated_tokens"]) < target_estimated_tokens:
         raise RuntimeError(
@@ -978,7 +1040,13 @@ def main() -> None:
         "--prefetch-records",
         type=int,
         default=int(os.environ.get("DG_TEACHER_PREFETCH_RECORDS", "128")),
-        help="Maximum number of streamed prompts buffered in RAM (default: 128).",
+        help="Maximum number of streamed prompts buffered in the disk spool (default: 128).",
+    )
+    parser.add_argument(
+        "--prefetch-dir",
+        type=Path,
+        default=Path(os.environ.get("DG_TEACHER_PREFETCH_DIR", "data/teacher_supervised/prompt_spool")),
+        help="Directory for the temporary SQLite prompt spool.",
     )
     parser.add_argument(
         "--student-prefix-length",
@@ -1117,6 +1185,7 @@ def main() -> None:
         max_consecutive_failures=args.max_consecutive_failures,
         concurrency=args.concurrency,
         prefetch_records=args.prefetch_records,
+        prefetch_dir=args.prefetch_dir,
         student_prefix_length=args.student_prefix_length,
     )
     _repair_jsonl_tail(args.output)

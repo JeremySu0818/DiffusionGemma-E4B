@@ -61,4 +61,5 @@ python -m diffusiongemma_e4b.teacher \
   --max-consecutive-failures "${DG_TEACHER_MAX_CONSECUTIVE_FAILURES:-20}" \
   --concurrency "${DG_TEACHER_CONCURRENCY:-4}" \
   --prefetch-records "${DG_TEACHER_PREFETCH_RECORDS:-128}" \
+  --prefetch-dir "${DG_TEACHER_PREFETCH_DIR:-data/teacher_supervised/prompt_spool}" \
   --student-prefix-length "${DG_PREFIX_LENGTH:-2048}"

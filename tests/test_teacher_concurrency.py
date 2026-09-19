@@ -9,6 +9,7 @@ import pytest
 
 from diffusiongemma_e4b import teacher
 from diffusiongemma_e4b.teacher import (
+    _DiskPromptQueue,
     TeacherConfig,
     _append_record_durable,
     generate_records,
@@ -284,6 +285,21 @@ def test_prefetch_reservoir_cannot_be_empty(tmp_path, monkeypatch):
                 tmp_path / "progress.json",
             )
         )
+
+
+def test_prompt_prefetch_payloads_are_spooled_to_disk_and_cleaned_up(tmp_path):
+    spool_root = tmp_path / "spool"
+    stop = threading.Event()
+    queue = _DiskPromptQueue(spool_root, max_records=2)
+    database_path = queue.path
+
+    assert queue.put(7, {"id": "p7", "prompt_text": "stored on disk"}, stop)
+    assert database_path.is_file()
+    assert queue.get() == (7, {"id": "p7", "prompt_text": "stored on disk"})
+
+    queue.finish()
+    queue.close()
+    assert not database_path.exists()
 
 
 def test_generated_mix_rejects_silently_lost_required_bucket():
