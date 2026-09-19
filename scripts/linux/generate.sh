@@ -60,6 +60,6 @@ python -m diffusiongemma_e4b.teacher \
   --tokenizer "${DG_STUDENT_MODEL:-artifacts/tokenizer_processor_gemma4_e4b}" \
   --max-consecutive-failures "${DG_TEACHER_MAX_CONSECUTIVE_FAILURES:-20}" \
   --concurrency "${DG_TEACHER_CONCURRENCY:-4}" \
-  --prefetch-records "${DG_TEACHER_PREFETCH_RECORDS:-128}" \
+  --prefetch-records "${DG_TEACHER_PREFETCH_RECORDS:-16384}" \
   --prefetch-dir "${DG_TEACHER_PREFETCH_DIR:-data/teacher_supervised/prompt_spool}" \
   --student-prefix-length "${DG_PREFIX_LENGTH:-2048}"

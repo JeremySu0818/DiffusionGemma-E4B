@@ -42,7 +42,7 @@ class TeacherConfig:
     api_key: str = ""
     max_consecutive_failures: int = 20
     concurrency: int = 8
-    prefetch_records: int = 128
+    prefetch_records: int = 16384
     prefetch_dir: Path | None = None
     student_prefix_length: int = 2048
 
@@ -635,11 +635,48 @@ class _DiskPromptQueue:
         self._max_records = max_records
         self._writer = sqlite3.connect(self.path, check_same_thread=False)
         self._reader = sqlite3.connect(self.path, check_same_thread=False)
-        self._writer.execute(
-            "CREATE TABLE IF NOT EXISTS prompts ("
-            "source_index INTEGER PRIMARY KEY, payload TEXT NOT NULL, "
-            "status TEXT NOT NULL CHECK(status IN ('queued', 'inflight', 'consumed')))"
-        )
+        # WAL lets the producer append while the scheduler dequeues. NORMAL
+        # synchronous mode avoids a full disk flush for every prefetched prompt;
+        # teacher_outputs.jsonl remains the per-record durable source of truth.
+        self._writer.execute("PRAGMA journal_mode=WAL")
+        for connection in (self._writer, self._reader):
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA temp_store=MEMORY")
+        columns = {
+            str(row[1])
+            for row in self._writer.execute("PRAGMA table_info(prompts)").fetchall()
+        }
+        if columns and "prompt_key" not in columns:
+            # Migrate position-keyed spools. Parallel source prefetch can alter
+            # arrival positions after a restart, while prompt IDs remain stable.
+            self._writer.execute("DROP INDEX IF EXISTS prompts_status_source_idx")
+            self._writer.execute("ALTER TABLE prompts RENAME TO prompts_legacy")
+            self._writer.execute(
+                "CREATE TABLE prompts ("
+                "prompt_key TEXT PRIMARY KEY, source_index INTEGER NOT NULL, "
+                "payload TEXT NOT NULL, "
+                "status TEXT NOT NULL CHECK(status IN ('queued', 'inflight', 'consumed')))"
+            )
+            legacy_rows = self._writer.execute(
+                "SELECT source_index, payload, status FROM prompts_legacy"
+            )
+            for source_index, payload, status in legacy_rows:
+                prompt_record = json.loads(payload)
+                prompt_key = str(prompt_record.get("id") or _sha256_json(prompt_record))
+                self._writer.execute(
+                    "INSERT OR IGNORE INTO prompts(prompt_key, source_index, payload, status) "
+                    "VALUES (?, ?, ?, ?)",
+                    (prompt_key, source_index, payload, status),
+                )
+            self._writer.execute("DROP TABLE prompts_legacy")
+        else:
+            self._writer.execute(
+                "CREATE TABLE IF NOT EXISTS prompts ("
+                "prompt_key TEXT PRIMARY KEY, source_index INTEGER NOT NULL, "
+                "payload TEXT NOT NULL, "
+                "status TEXT NOT NULL CHECK(status IN ('queued', 'inflight', 'consumed')))"
+            )
         # Older versions retained every acknowledged row as ``consumed``,
         # causing unbounded database growth. Completed prompt identity already
         # lives durably in teacher_outputs.jsonl, so the spool must contain
@@ -648,26 +685,32 @@ class _DiskPromptQueue:
         # A process may have stopped after dequeueing but before durably writing
         # its teacher output. Make those rows available again on restart.
         self._writer.execute("UPDATE prompts SET status = 'queued' WHERE status = 'inflight'")
+        self._writer.execute(
+            "CREATE INDEX IF NOT EXISTS prompts_status_source_idx "
+            "ON prompts(status, source_index)"
+        )
         self._writer.commit()
+        row = self._writer.execute("SELECT COUNT(*) FROM prompts").fetchone()
+        self._active_records = int(row[0]) if row else 0
 
     def _active_count(self) -> int:
-        row = self._writer.execute(
-            "SELECT COUNT(*) FROM prompts WHERE status != 'consumed'"
-        ).fetchone()
-        return int(row[0]) if row else 0
+        return self._active_records
 
     def put(self, source_index: int, prompt_record: dict[str, Any], stop: threading.Event) -> bool:
         payload = json.dumps(prompt_record, ensure_ascii=False, separators=(",", ":"))
+        prompt_key = str(prompt_record.get("id") or _sha256_json(prompt_record))
         with self._condition:
             while not stop.is_set() and self._active_count() >= self._max_records:
                 self._condition.wait(timeout=0.1)
             if stop.is_set():
                 return False
-            self._writer.execute(
-                "INSERT OR IGNORE INTO prompts(source_index, payload, status) VALUES (?, ?, 'queued')",
-                (source_index, payload),
+            cursor = self._writer.execute(
+                "INSERT OR IGNORE INTO prompts(prompt_key, source_index, payload, status) "
+                "VALUES (?, ?, ?, 'queued')",
+                (prompt_key, source_index, payload),
             )
             self._writer.commit()
+            self._active_records += max(0, cursor.rowcount)
             self._condition.notify_all()
             return True
 
@@ -683,8 +726,8 @@ class _DiskPromptQueue:
             row = None
             while row is None and not self._closed:
                 row = self._reader.execute(
-                    "SELECT source_index, payload FROM prompts "
-                    "WHERE status = 'queued' ORDER BY source_index LIMIT 1"
+                    "SELECT prompt_key, source_index, payload FROM prompts "
+                    "WHERE status = 'queued' ORDER BY source_index, prompt_key LIMIT 1"
                 ).fetchone()
                 if row is not None:
                     break
@@ -694,25 +737,26 @@ class _DiskPromptQueue:
                 self._condition.wait(timeout=remaining)
             if row is None:
                 row = self._reader.execute(
-                    "SELECT source_index, payload FROM prompts "
-                    "WHERE status = 'queued' ORDER BY source_index LIMIT 1"
+                    "SELECT prompt_key, source_index, payload FROM prompts "
+                    "WHERE status = 'queued' ORDER BY source_index, prompt_key LIMIT 1"
                 ).fetchone()
             if row is None:
                 if self._error is not None:
                     raise self._error
                 return None
             self._reader.execute(
-                "UPDATE prompts SET status = 'inflight' WHERE source_index = ?", (row[0],)
+                "UPDATE prompts SET status = 'inflight' WHERE prompt_key = ?", (row[0],)
             )
             self._reader.commit()
-        return int(row[0]), json.loads(row[1])
+        return int(row[1]), json.loads(row[2])
 
-    def acknowledge(self, source_index: int) -> None:
+    def acknowledge(self, prompt_key: str) -> None:
         with self._condition:
-            self._reader.execute(
-                "DELETE FROM prompts WHERE source_index = ?", (source_index,)
+            cursor = self._reader.execute(
+                "DELETE FROM prompts WHERE prompt_key = ?", (prompt_key,)
             )
             self._reader.commit()
+            self._active_records = max(0, self._active_records - max(0, cursor.rowcount))
             self._condition.notify_all()
 
     def requeue_inflight(self) -> None:
@@ -845,7 +889,7 @@ def _generate_records_concurrent(
             source_index, prompt_record = source_item
             prompt_record_id = str(prompt_record.get("id") or _sha256_json(prompt_record))
             if prompt_record_id in scheduled_prompt_ids:
-                source_queue.acknowledge(source_index)
+                source_queue.acknowledge(prompt_record_id)
                 continue
             prompt = _build_prompt(prompt_record)
             media = dict(prompt_record.get("media") or {})
@@ -909,7 +953,7 @@ def _generate_records_concurrent(
                 state["last_failed_prompt_id"] = item.prompt_record_id
                 state["last_failure"] = str(exc)
                 save_progress(progress_path, state)
-                source_queue.acknowledge(item.source_index)
+                source_queue.acknowledge(item.prompt_record_id)
                 if consecutive_failures >= cfg.max_consecutive_failures:
                     raise RuntimeError(
                         f"teacher failed {consecutive_failures} consecutive prompts; aborting to avoid silent underfill"
@@ -928,7 +972,7 @@ def _generate_records_concurrent(
                 )
                 state["last_filter_reason"] = "duplicate_teacher_output"
                 save_progress(progress_path, state)
-                source_queue.acknowledge(item.source_index)
+                source_queue.acknowledge(item.prompt_record_id)
                 fill_window()
                 continue
 
@@ -976,7 +1020,7 @@ def _generate_records_concurrent(
             # Completion order is durable output order. Stable prompt IDs and
             # source_index metadata preserve exact resume and audit identity.
             yield record
-            source_queue.acknowledge(item.source_index)
+            source_queue.acknowledge(item.prompt_record_id)
             pending.remove(item)
             seen_text_hashes.add(text_hash)
             existing_prompt_ids.add(item.prompt_record_id)
@@ -1100,12 +1144,24 @@ def main() -> None:
         type=float,
         default=float(os.environ.get("DG_STREAM_RETRY_MAX_S", "60")),
     )
+    parser.add_argument(
+        "--stream-checkpoint-rows",
+        type=int,
+        default=int(os.environ.get("DG_STREAM_CHECKPOINT_ROWS", "256")),
+        help="Snapshot resumable HF stream state every N rows; 0 disables snapshots.",
+    )
+    parser.add_argument(
+        "--stream-source-prefetch-records",
+        type=int,
+        default=int(os.environ.get("DG_STREAM_SOURCE_PREFETCH_RECORDS", "64")),
+        help="Per-source background row buffer used to hide remote shard latency.",
+    )
     parser.add_argument("--concurrency", type=int, default=int(os.environ.get("DG_TEACHER_CONCURRENCY", "8")))
     parser.add_argument(
         "--prefetch-records",
         type=int,
-        default=int(os.environ.get("DG_TEACHER_PREFETCH_RECORDS", "128")),
-        help="Maximum number of streamed prompts buffered in the disk spool (default: 128).",
+        default=int(os.environ.get("DG_TEACHER_PREFETCH_RECORDS", "16384")),
+        help="Maximum number of streamed prompts buffered in the disk spool (default: 16384).",
     )
     parser.add_argument(
         "--prefetch-dir",
@@ -1183,7 +1239,9 @@ def main() -> None:
                 "max_retries": args.stream_max_retries,
                 "base_s": args.stream_retry_base_s,
                 "max_s": args.stream_retry_max_s,
+                "checkpoint_rows": args.stream_checkpoint_rows,
             },
+            source_prefetch_records=args.stream_source_prefetch_records,
         )
         configured_min_tokens = int(source_config.get("teacher_output_filters", {}).get("min_estimated_tokens", 8))
 

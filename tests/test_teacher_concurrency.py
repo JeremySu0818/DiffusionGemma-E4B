@@ -316,7 +316,7 @@ def test_concurrency_does_not_change_generation_fingerprint():
 
     assert generation_fingerprint(one, "data") == generation_fingerprint(many, "data")
     assert TeacherConfig("openai-compatible", "m", "http://x", 1, 0.2, 0.95).concurrency == 8
-    assert TeacherConfig("openai-compatible", "m", "http://x", 1, 0.2, 0.95).prefetch_records == 128
+    assert TeacherConfig("openai-compatible", "m", "http://x", 1, 0.2, 0.95).prefetch_records == 16384
 
 
 def test_prefetch_reservoir_cannot_be_empty(tmp_path, monkeypatch):
@@ -345,7 +345,7 @@ def test_prompt_prefetch_payloads_persist_and_resume_from_disk(tmp_path):
 
     resumed = _DiskPromptQueue(spool_root, max_records=2, fingerprint="unit")
     assert resumed.get() == (7, {"id": "p7", "prompt_text": "stored on disk"})
-    resumed.acknowledge(7)
+    resumed.acknowledge("p7")
     resumed.finish()
     resumed.close()
     assert database_path.exists()
@@ -367,6 +367,49 @@ def test_prompt_spool_removes_legacy_consumed_rows_on_open(tmp_path):
     reopened.close()
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM prompts").fetchone()[0] == 0
+
+
+def test_prompt_spool_keys_resume_payloads_by_stable_prompt_id(tmp_path):
+    stop = threading.Event()
+    queue = _DiskPromptQueue(tmp_path / "spool", max_records=4, fingerprint="stable-ids")
+
+    assert queue.put(3, {"id": "p1", "prompt_text": "first ordering"}, stop)
+    assert queue.put(3, {"id": "p2", "prompt_text": "changed ordering"}, stop)
+    first = queue.get()
+    assert first is not None
+    queue.acknowledge(first[1]["id"])
+    second = queue.get()
+    assert second is not None
+    queue.acknowledge(second[1]["id"])
+    queue.close()
+
+    assert {first[1]["id"], second[1]["id"]} == {"p1", "p2"}
+
+
+def test_prompt_spool_migrates_position_keyed_database(tmp_path):
+    spool_root = tmp_path / "spool"
+    spool_root.mkdir()
+    database_path = spool_root / "prompts-old-schema.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE prompts (source_index INTEGER PRIMARY KEY, payload TEXT NOT NULL, "
+            "status TEXT NOT NULL CHECK(status IN ('queued', 'inflight', 'consumed')))"
+        )
+        connection.execute(
+            "INSERT INTO prompts(source_index, payload, status) VALUES (?, ?, 'queued')",
+            (11, json.dumps({"id": "old-prompt", "prompt_text": "resume me"})),
+        )
+
+    queue = _DiskPromptQueue(spool_root, max_records=4, fingerprint="old-schema")
+    assert queue.get() == (11, {"id": "old-prompt", "prompt_text": "resume me"})
+    queue.acknowledge("old-prompt")
+    queue.close()
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(prompts)").fetchall()
+        }
+        assert "prompt_key" in columns
 
 
 def test_generated_mix_rejects_silently_lost_required_bucket():

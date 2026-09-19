@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import errno
 import hashlib
 import io
 import json
 import math
 import os
+import queue
 import re
 import random
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -369,12 +372,21 @@ class _ResilientDatasetIterator:
     def __init__(self, source: dict[str, Any], retry_config: dict[str, Any] | None = None):
         self.source = source
         self.rows_read = 0
+        self.dataset: Any | None = None
         self.iterator: Iterator[dict[str, Any]] | None = None
+        self.resume_state: dict[str, Any] | None = None
+        self.resume_rows = 0
         retry_config = retry_config or {}
         self.max_retries = int(retry_config.get("max_retries", 8))
         self.retry_base_s = float(retry_config.get("base_s", 2.0))
         self.retry_max_s = float(retry_config.get("max_s", 60.0))
-        if self.max_retries < 0 or self.retry_base_s < 0 or self.retry_max_s < 0:
+        self.checkpoint_rows = int(retry_config.get("checkpoint_rows", 256))
+        if (
+            self.max_retries < 0
+            or self.retry_base_s < 0
+            or self.retry_max_s < 0
+            or self.checkpoint_rows < 0
+        ):
             raise ValueError("stream retry settings must be non-negative")
 
     def __iter__(self) -> _ResilientDatasetIterator:
@@ -382,14 +394,58 @@ class _ResilientDatasetIterator:
 
     def _reopen(self) -> None:
         dataset = _open_hf_dataset(self.source)
-        if self.rows_read:
+        restored_rows = 0
+        can_snapshot = callable(getattr(dataset, "state_dict", None)) and callable(
+            getattr(dataset, "load_state_dict", None)
+        )
+        if self.resume_state is not None:
+            restore = getattr(dataset, "load_state_dict", None)
+            if callable(restore):
+                try:
+                    restore(copy.deepcopy(self.resume_state))
+                    restored_rows = self.resume_rows
+                except Exception:  # Fall back to the portable skip path below.
+                    dataset = _open_hf_dataset(self.source)
+                    can_snapshot = callable(getattr(dataset, "state_dict", None)) and callable(
+                        getattr(dataset, "load_state_dict", None)
+                    )
+                    restored_rows = 0
+        rows_to_skip = self.rows_read - restored_rows
+        if rows_to_skip and can_snapshot:
+            # Replay at most checkpoint_rows-1 records on the unchanged dataset
+            # pipeline. Applying dataset.skip() here would wrap the pipeline,
+            # making its next state_dict incompatible with a freshly opened
+            # dataset on a later retry.
+            iterator = iter(dataset)
+            for _ in range(rows_to_skip):
+                next(iterator)
+            self.dataset = dataset
+            self.iterator = iterator
+            return
+        if rows_to_skip:
             skip = getattr(dataset, "skip", None)
             if not callable(skip):
                 raise SourceStreamError(
                     f"streaming dataset {self.source['id']} cannot resume: iterator has no skip()"
                 )
-            dataset = skip(self.rows_read)
+            dataset = skip(rows_to_skip)
+        self.dataset = dataset
         self.iterator = iter(dataset)
+
+    def _checkpoint(self) -> None:
+        if self.checkpoint_rows <= 0 or self.rows_read % self.checkpoint_rows:
+            return
+        state_dict = getattr(self.dataset, "state_dict", None)
+        if not callable(state_dict):
+            return
+        try:
+            self.resume_state = copy.deepcopy(state_dict())
+            self.resume_rows = self.rows_read
+        except Exception:
+            # Checkpointing is an optimization. The exact but slower skip-based
+            # recovery path remains available when a dataset cannot snapshot.
+            self.resume_state = None
+            self.resume_rows = 0
 
     def __next__(self) -> dict[str, Any]:
         errors: list[str] = []
@@ -400,6 +456,7 @@ class _ResilientDatasetIterator:
                 assert self.iterator is not None
                 row = next(self.iterator)
                 self.rows_read += 1
+                self._checkpoint()
                 return row
             except StopIteration:
                 raise
@@ -410,6 +467,7 @@ class _ResilientDatasetIterator:
                         f"{self.rows_read}: {type(exc).__name__}: {exc}"
                     ) from exc
                 errors.append(f"attempt={attempt + 1}: {type(exc).__name__}: {exc}")
+                self.dataset = None
                 self.iterator = None
                 if attempt >= self.max_retries:
                     break
@@ -517,6 +575,77 @@ class _SourceState:
     rows_read: int = 0
 
 
+@dataclass
+class _PrefetchFailure:
+    error: BaseException
+
+
+_PREFETCH_END = object()
+
+
+class _BackgroundPrefetchIterator:
+    """Read one remote dataset ahead without letting it block other sources."""
+
+    def __init__(self, rows: Iterator[dict[str, Any]], max_records: int, name: str):
+        self._rows = rows
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=max_records)
+        self._stop = threading.Event()
+        self._done = False
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name)[:48]
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"dataset-prefetch-{safe_name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def __iter__(self) -> _BackgroundPrefetchIterator:
+        return self
+
+    def _publish(self, value: Any) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(value, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self) -> None:
+        terminal: Any = _PREFETCH_END
+        try:
+            while not self._stop.is_set():
+                if not self._publish(next(self._rows)):
+                    return
+        except StopIteration:
+            pass
+        except BaseException as exc:  # Re-raised by the consuming thread.
+            terminal = _PrefetchFailure(exc)
+        finally:
+            self._publish(terminal)
+            close = getattr(self._rows, "close", None)
+            if callable(close):
+                close()
+
+    def next(self, timeout: float | None = None) -> dict[str, Any]:
+        if self._done:
+            raise StopIteration
+        value = self._queue.get(timeout=timeout)
+        if value is _PREFETCH_END:
+            self._done = True
+            raise StopIteration
+        if isinstance(value, _PrefetchFailure):
+            self._done = True
+            raise value.error
+        return value
+
+    def __next__(self) -> dict[str, Any]:
+        return self.next()
+
+    def close(self) -> None:
+        self._stop.set()
+
+
 def iter_prompt_records(
     config: dict[str, Any],
     source_names: set[str] | None,
@@ -525,7 +654,10 @@ def iter_prompt_records(
     max_records_per_source: int = 0,
     max_total_records: int = 0,
     streaming_retry: dict[str, Any] | None = None,
+    source_prefetch_records: int = 64,
 ) -> Iterable[dict[str, Any]]:
+    if source_prefetch_records < 0:
+        raise ValueError("source_prefetch_records must be non-negative")
     sources = [
         src
         for src in config["sources"]
@@ -548,7 +680,27 @@ def iter_prompt_records(
                 if source.get("manifest_only")
                 else _load_dataset_iter(source, streaming_retry)
             )
-            state = _SourceState(source, iter(rows), _bounded_limit(source, max_records_per_source))
+            row_iterator: Iterator[dict[str, Any]] = iter(rows)
+            if (
+                source_prefetch_records > 0
+                and bool(source.get("streaming", True))
+                and not source.get("manifest_only")
+            ):
+                # Decoded image/audio rows can be large, so keep only a couple
+                # in memory while allowing lightweight text sources to read far
+                # enough ahead to hide shard-open and network latency.
+                modality = str(source.get("modality") or "text")
+                per_source_records = (
+                    min(source_prefetch_records, 2)
+                    if modality in {"image", "audio"}
+                    else source_prefetch_records
+                )
+                row_iterator = _BackgroundPrefetchIterator(
+                    row_iterator,
+                    max_records=max(1, per_source_records),
+                    name=str(source.get("name") or source["id"]),
+                )
+            state = _SourceState(source, row_iterator, _bounded_limit(source, max_records_per_source))
             by_bucket[bucket].append(state)
             all_states.append(state)
         except Exception as exc:  # noqa: BLE001
@@ -569,14 +721,28 @@ def iter_prompt_records(
             state = states[cursor]
             source_cursor[bucket] = cursor + 1
             if state.limit > 0 and state.yielded >= state.limit:
+                close = getattr(state.rows, "close", None)
+                if callable(close):
+                    close()
                 states.pop(cursor)
                 if states:
                     source_cursor[bucket] %= len(states)
                 continue
             try:
-                row = next(state.rows)
+                if isinstance(state.rows, _BackgroundPrefetchIterator):
+                    # Do not let one source opening a shard hold up ready
+                    # sources in the same bucket. Prompt IDs, rather than these
+                    # timing-dependent positions, are the durable resume key.
+                    row = state.rows.next(timeout=0.05 if len(states) > 1 else None)
+                else:
+                    row = next(state.rows)
                 state.rows_read += 1
+            except queue.Empty:
+                continue
             except StopIteration:
+                close = getattr(state.rows, "close", None)
+                if callable(close):
+                    close()
                 states.pop(cursor)
                 if states:
                     source_cursor[bucket] %= len(states)
@@ -589,6 +755,9 @@ def iter_prompt_records(
                 # Other sources in the same bucket must still satisfy it.
                 if state.rows_read == 0 and not bool(state.source.get("required", False)):
                     source_id = str(state.source.get("id"))
+                    close = getattr(state.rows, "close", None)
+                    if callable(close):
+                        close()
                     states.pop(cursor)
                     if states:
                         source_cursor[bucket] %= len(states)
@@ -639,6 +808,10 @@ def iter_prompt_records(
             if requested_total > 0 and total_records >= requested_total:
                 break
     finally:
+        for state in all_states:
+            close = getattr(state.rows, "close", None)
+            if callable(close):
+                close()
         summary = {
             "dataset_mix_summary": {
                 "requested_records": requested_total,
@@ -727,6 +900,16 @@ def main() -> None:
         type=float,
         default=float(os.environ.get("DG_STREAM_RETRY_MAX_S", "60")),
     )
+    parser.add_argument(
+        "--stream-checkpoint-rows",
+        type=int,
+        default=int(os.environ.get("DG_STREAM_CHECKPOINT_ROWS", "256")),
+    )
+    parser.add_argument(
+        "--stream-source-prefetch-records",
+        type=int,
+        default=int(os.environ.get("DG_STREAM_SOURCE_PREFETCH_RECORDS", "64")),
+    )
     args = parser.parse_args()
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
@@ -742,7 +925,9 @@ def main() -> None:
             "max_retries": args.stream_max_retries,
             "base_s": args.stream_retry_base_s,
             "max_s": args.stream_retry_max_s,
+            "checkpoint_rows": args.stream_checkpoint_rows,
         },
+        source_prefetch_records=args.stream_source_prefetch_records,
     )
     result = write_jsonl(args.output, rows)
     print(json.dumps(result, indent=2, ensure_ascii=False))

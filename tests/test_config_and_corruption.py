@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -163,6 +164,105 @@ def test_streaming_dataset_retries_and_resumes_from_rows_read(monkeypatch):
     assert list(iterator) == rows
     assert opens == 2
     assert skipped == [1]
+
+
+def test_streaming_dataset_retry_restores_recent_checkpoint(monkeypatch):
+    rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
+    opens = 0
+    loaded_states: list[dict[str, int]] = []
+    skipped: list[int] = []
+
+    class Dataset:
+        def __init__(self, fail_after_first=False):
+            self.position = 0
+            self.fail_after_first = fail_after_first
+            self.failed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.fail_after_first and self.position == 1 and not self.failed:
+                self.failed = True
+                raise ConnectionResetError("network interrupted")
+            if self.position >= len(rows):
+                raise StopIteration
+            row = rows[self.position]
+            self.position += 1
+            return row
+
+        def state_dict(self):
+            return {"position": self.position}
+
+        def load_state_dict(self, state):
+            loaded_states.append(dict(state))
+            self.position = state["position"]
+
+        def skip(self, count):
+            skipped.append(count)
+            self.position += count
+            return self
+
+    def open_dataset(_source):
+        nonlocal opens
+        opens += 1
+        return Dataset(fail_after_first=opens == 1)
+
+    monkeypatch.setattr(data_sources, "_open_hf_dataset", open_dataset)
+    iterator = _ResilientDatasetIterator(
+        {"id": "unit/stream"},
+        {"max_retries": 2, "base_s": 0, "checkpoint_rows": 1},
+    )
+
+    assert list(iterator) == rows
+    assert opens == 2
+    assert loaded_states == [{"position": 1}]
+    assert skipped == []
+
+
+def test_parallel_stream_prefetch_bypasses_a_stalled_source(tmp_path, monkeypatch):
+    release_slow_source = threading.Event()
+    fast_source_prefetched = threading.Event()
+
+    def source_rows(source, _retry_config=None):
+        if source["id"] == "slow":
+            def delayed():
+                release_slow_source.wait(timeout=2)
+                yield {"prompt": "slow prompt"}
+
+            return delayed()
+
+        def fast():
+            fast_source_prefetched.set()
+            yield {"prompt": "fast prompt"}
+
+        return fast()
+
+    monkeypatch.setattr(data_sources, "_load_dataset_iter", source_rows)
+    config = {
+        "recommended_mix": [{"bucket": "text", "share": 1.0, "required": True}],
+        "sources": [
+            {"id": "slow", "bucket": "text", "modality": "text", "streaming": True},
+            {"id": "fast", "bucket": "text", "modality": "text", "streaming": True},
+        ],
+    }
+
+    records = iter_prompt_records(
+        config,
+        None,
+        100,
+        tmp_path,
+        max_total_records=1,
+        source_prefetch_records=2,
+    )
+    try:
+        record = next(iter(records))
+    finally:
+        records.close()
+        release_slow_source.set()
+
+    assert fast_source_prefetched.is_set()
+    assert record["source"] == "fast"
 
 
 def test_iteration_failure_does_not_silently_remove_source(tmp_path, monkeypatch):
