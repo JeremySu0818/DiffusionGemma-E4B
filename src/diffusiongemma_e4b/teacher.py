@@ -154,6 +154,17 @@ class _ThroughputMeter:
         return smoothed
 
 
+def _throughput_eta(
+    target_tokens: int,
+    current_tokens: int,
+    total_tps: float | None,
+) -> str:
+    if total_tps is None or total_tps <= 0:
+        return "?"
+    remaining_tokens = max(0, target_tokens - current_tokens)
+    return tqdm.format_interval(remaining_tokens / total_tps)
+
+
 def _response_text(data: Any) -> str:
     if not isinstance(data, dict):
         raise ValueError("teacher response is not a JSON object")
@@ -1557,7 +1568,7 @@ def main() -> None:
             unit_scale=True,
             dynamic_ncols=True,
             desc="Generating teacher dataset",
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}{postfix}]",
         )
     elif args.max_total_records > 0:
         pbar = tqdm(
@@ -1587,6 +1598,8 @@ def main() -> None:
         "records": initial_records,
         "total_tps": "warming",
     }
+    if args.target_estimated_tokens > 0:
+        progress_fields["eta"] = "?"
 
     def refresh_throughput() -> None:
         while not progress_stop.wait(1.0):
@@ -1595,6 +1608,12 @@ def main() -> None:
                 progress_fields["total_tps"] = (
                     f"{total_tps:.1f}" if total_tps is not None else "warming"
                 )
+                if args.target_estimated_tokens > 0:
+                    progress_fields["eta"] = _throughput_eta(
+                        args.target_estimated_tokens,
+                        current_tokens,
+                        total_tps,
+                    )
                 pbar.set_postfix(progress_fields, refresh=True)
 
     progress_thread = threading.Thread(

@@ -12,12 +12,19 @@ from diffusiongemma_e4b import teacher
 from diffusiongemma_e4b.teacher import (
     _DiskPromptQueue,
     _ThroughputMeter,
+    _throughput_eta,
     TeacherConfig,
     _append_record_durable,
     generate_records,
     generation_fingerprint,
     validate_generated_mix,
 )
+
+
+def test_throughput_eta_uses_remaining_target_tokens_over_total_tps():
+    assert _throughput_eta(550, 50, 100.0) == "00:05"
+    assert _throughput_eta(550, 550, 100.0) == "00:00"
+    assert _throughput_eta(550, 50, None) == "?"
 
 
 def test_streaming_throughput_sums_ten_workers_without_a_fixed_multiplier():
