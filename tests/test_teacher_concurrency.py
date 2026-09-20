@@ -11,12 +11,40 @@ import pytest
 from diffusiongemma_e4b import teacher
 from diffusiongemma_e4b.teacher import (
     _DiskPromptQueue,
+    _GenerationResult,
+    _ThroughputMeter,
     TeacherConfig,
     _append_record_durable,
     generate_records,
     generation_fingerprint,
     validate_generated_mix,
 )
+
+
+def _throughput_generation(server_tokens: int):
+    return _GenerationResult(
+        text="answer",
+        completion_tokens=server_tokens,
+        request_started=100.0,
+        request_finished=101.0,
+    )
+
+
+def test_throughput_uses_observed_parallel_requests_not_a_fixed_multiplier():
+    meter = _ThroughputMeter(window_seconds=30)
+    for _ in range(10):
+        meter.observe(
+            _throughput_generation(22),
+            fallback_server_tokens=20,
+            accepted_dataset_tokens=20,
+        )
+
+    rates = meter.snapshot()
+
+    assert rates["server_tps"] == pytest.approx(220.0)
+    assert rates["dataset_tps"] == pytest.approx(200.0)
+    assert rates["observed_concurrency"] == 10
+    assert rates["server_tokens_native"] is True
 
 
 def _cfg(concurrency: int) -> TeacherConfig:

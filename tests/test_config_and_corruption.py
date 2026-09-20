@@ -455,7 +455,10 @@ class _FakeResponse:
         return None
 
     def json(self):
-        return {"choices": [{"message": {"content": "A valid teacher answer."}}]}
+        return {
+            "choices": [{"message": {"content": "A valid teacher answer."}}],
+            "usage": {"completion_tokens": 17},
+        }
 
 
 class _FakeSession:
@@ -472,7 +475,10 @@ def test_openai_teacher_always_uses_chat_completions():
     client = OpenAICompletionsClient(cfg)
     client.session = _FakeSession()
 
-    assert client.generate("hello") == "A valid teacher answer."
+    result = client.generate("hello")
+    assert result == "A valid teacher answer."
+    assert result.completion_tokens == 17
+    assert result.request_seconds >= 0
     url, request = client.session.calls[0]
     assert url.endswith("/chat/completions")
     assert request["json"]["messages"] == [{"role": "user", "content": "hello"}]
