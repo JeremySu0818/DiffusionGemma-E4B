@@ -460,6 +460,20 @@ class _FakeResponse:
             "usage": {"completion_tokens": 17},
         }
 
+    def iter_lines(self, decode_unicode=False):
+        events = [
+            {"choices": [{"delta": {"reasoning_content": "thinking"}}]},
+            {
+                "choices": [
+                    {"delta": {"content": "A valid teacher answer."}}
+                ]
+            },
+            {"choices": [], "usage": {"completion_tokens": 17}},
+        ]
+        for event in events:
+            yield "data: " + json.dumps(event)
+        yield "data: [DONE]"
+
 
 class _FakeSession:
     def __init__(self):
@@ -475,13 +489,20 @@ def test_openai_teacher_always_uses_chat_completions():
     client = OpenAICompletionsClient(cfg)
     client.session = _FakeSession()
 
-    result = client.generate("hello")
+    deltas = []
+    result = client.generate(
+        "hello", on_delta=lambda text, _at: deltas.append(text)
+    )
     assert result == "A valid teacher answer."
+    assert deltas == ["thinking", "A valid teacher answer."]
     assert result.completion_tokens == 17
     assert result.request_seconds >= 0
     url, request = client.session.calls[0]
     assert url.endswith("/chat/completions")
     assert request["json"]["messages"] == [{"role": "user", "content": "hello"}]
+    assert request["json"]["stream"] is True
+    assert request["json"]["stream_options"] == {"include_usage": True}
+    assert request["stream"] is True
     assert "prompt" not in request["json"]
 
 

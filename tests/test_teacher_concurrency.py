@@ -11,7 +11,6 @@ import pytest
 from diffusiongemma_e4b import teacher
 from diffusiongemma_e4b.teacher import (
     _DiskPromptQueue,
-    _GenerationResult,
     _ThroughputMeter,
     TeacherConfig,
     _append_record_durable,
@@ -21,30 +20,24 @@ from diffusiongemma_e4b.teacher import (
 )
 
 
-def _throughput_generation(server_tokens: int):
-    return _GenerationResult(
-        text="answer",
-        completion_tokens=server_tokens,
-        request_started=100.0,
-        request_finished=101.0,
-    )
-
-
-def test_throughput_uses_observed_parallel_requests_not_a_fixed_multiplier():
-    meter = _ThroughputMeter(window_seconds=30)
+def test_streaming_throughput_sums_ten_workers_without_a_fixed_multiplier():
+    meter = _ThroughputMeter(window_seconds=5, ewma_alpha=1.0)
     for _ in range(10):
-        meter.observe(
-            _throughput_generation(22),
-            fallback_server_tokens=20,
-            accepted_dataset_tokens=20,
-        )
+        request_id = meter.begin_request()
+        meter.record_tokens(request_id, 101.5, 22)
+        meter.finish_request(request_id, 22)
 
-    rates = meter.snapshot()
 
-    assert rates["server_tps"] == pytest.approx(220.0)
-    assert rates["dataset_tps"] == pytest.approx(200.0)
-    assert rates["observed_concurrency"] == 10
-    assert rates["server_tokens_native"] is True
+    assert meter.total_tps(now=102.1) == pytest.approx(220.0)
+
+
+def test_streaming_throughput_reconciles_buffered_chunks_with_api_usage():
+    meter = _ThroughputMeter(window_seconds=5, ewma_alpha=1.0)
+    request_id = meter.begin_request()
+    meter.record_tokens(request_id, 101.5, 1)
+    meter.finish_request(request_id, 2)
+
+    assert meter.total_tps(now=102.1) == pytest.approx(2.0)
 
 
 def _cfg(concurrency: int) -> TeacherConfig:

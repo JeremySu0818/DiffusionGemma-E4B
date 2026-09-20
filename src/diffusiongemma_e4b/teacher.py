@@ -4,6 +4,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
@@ -84,62 +85,73 @@ class _GenerationResult:
 
 
 class _ThroughputMeter:
-    """Observed aggregate throughput; never multiplies by configured workers."""
+    """Aggregate streamed token deltas on one shared monotonic timeline."""
 
-    def __init__(self, window_seconds: float = 30.0):
+    def __init__(self, window_seconds: float = 5.0, ewma_alpha: float = 0.2):
         self.window_seconds = window_seconds
-        self._events: deque[tuple[float, float, int, int, bool]] = deque()
+        self.ewma_alpha = ewma_alpha
+        self._bucket_tokens: dict[int, float] = {}
+        self._request_tokens: dict[int, dict[int, float]] = {}
+        self._next_request_id = 0
+        self._lock = threading.Lock()
 
-    def observe(
-        self,
-        generation: _GenerationResult,
-        *,
-        fallback_server_tokens: int,
-        accepted_dataset_tokens: int,
-    ) -> None:
-        completed = generation.request_finished
-        duration = generation.generation_seconds
-        started = (
-            completed - duration
-            if isinstance(duration, (int, float)) and duration > 0
-            else generation.request_started
-        )
-        reported_tokens = generation.completion_tokens
-        native = isinstance(reported_tokens, int) and reported_tokens >= 0
-        server_tokens = int(reported_tokens) if native else fallback_server_tokens
-        self._events.append(
-            (started, completed, server_tokens, accepted_dataset_tokens, native)
-        )
-        cutoff = completed - self.window_seconds
-        while len(self._events) > 1 and self._events[0][1] < cutoff:
-            self._events.popleft()
+    def begin_request(self) -> int:
+        with self._lock:
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            self._request_tokens[request_id] = {}
+            return request_id
 
-    def snapshot(self) -> dict[str, float | int | bool]:
-        if not self._events:
-            return {
-                "server_tps": 0.0,
-                "dataset_tps": 0.0,
-                "observed_concurrency": 0,
-                "server_tokens_native": False,
-            }
-        started = min(event[0] for event in self._events)
-        finished = max(event[1] for event in self._events)
-        elapsed = max(finished - started, 1e-9)
-        points: list[tuple[float, int]] = []
-        for request_started, request_finished, *_ in self._events:
-            points.append((request_started, 1))
-            points.append((request_finished, -1))
-        active = peak = 0
-        # End events sort before start events at an identical timestamp.
-        for _, delta in sorted(points, key=lambda point: (point[0], point[1])):
-            active += delta
-            peak = max(peak, active)
-        return {
-            "server_tps": sum(event[2] for event in self._events) / elapsed,
-            "dataset_tps": sum(event[3] for event in self._events) / elapsed,
-            "observed_concurrency": peak,
-            "server_tokens_native": all(event[4] for event in self._events),
-        }
+    def record_tokens(self, request_id: int, at: float, tokens: int) -> None:
+        if tokens <= 0:
+            return
+        bucket = math.floor(at)
+        with self._lock:
+            request = self._request_tokens.get(request_id)
+            if request is None:
+                return
+            request[bucket] = request.get(bucket, 0.0) + tokens
+            self._bucket_tokens[bucket] = self._bucket_tokens.get(bucket, 0.0) + tokens
+            self._prune_locked(at)
+
+    def finish_request(self, request_id: int, completion_tokens: int | None) -> None:
+        with self._lock:
+            request = self._request_tokens.pop(request_id, {})
+            estimated = sum(request.values())
+            if completion_tokens is not None and completion_tokens >= 0 and estimated > 0:
+                scale = completion_tokens / estimated
+                for bucket, tokens in request.items():
+                    self._bucket_tokens[bucket] = (
+                        self._bucket_tokens.get(bucket, 0.0)
+                        + tokens * (scale - 1.0)
+                    )
+
+    def cancel_request(self, request_id: int) -> None:
+        # Generated tokens still consumed server throughput even when output
+        # validation or the HTTP request later fails, so retain bucket counts.
+        with self._lock:
+            self._request_tokens.pop(request_id, None)
+
+    def _prune_locked(self, now: float) -> None:
+        oldest = math.floor(now - self.window_seconds - 2.0)
+        for bucket in tuple(self._bucket_tokens):
+            if bucket < oldest:
+                del self._bucket_tokens[bucket]
+
+    def total_tps(self, now: float | None = None) -> float | None:
+        now = time.monotonic() if now is None else now
+        last_complete = math.floor(now) - 1
+        first = last_complete - math.ceil(self.window_seconds) + 1
+        with self._lock:
+            self._prune_locked(now)
+            values = [self._bucket_tokens.get(bucket, 0.0) for bucket in range(first, last_complete + 1)]
+        if not values or not any(values):
+            return None
+        first_nonzero = next(index for index, value in enumerate(values) if value > 0)
+        smoothed = values[first_nonzero]
+        for value in values[first_nonzero + 1:]:
+            smoothed = self.ewma_alpha * value + (1.0 - self.ewma_alpha) * smoothed
+        return smoothed
 
 
 def _response_text(data: Any) -> str:
@@ -169,13 +181,19 @@ class OpenAICompletionsClient(TeacherClient):
         if cfg.api_key:
             self.session.headers.update({"Authorization": f"Bearer {cfg.api_key}"})
 
-    def generate(self, prompt: str, media: dict[str, Any] | None = None) -> str:
+    def generate(
+        self,
+        prompt: str,
+        media: dict[str, Any] | None = None,
+        on_delta: Callable[[str, float], None] | None = None,
+    ) -> str:
         payload: dict[str, Any] = {
             "model": self.cfg.model,
             "messages": [{"role": "user", "content": _chat_content(prompt, media or {})}],
             "temperature": self.cfg.temperature,
             "top_p": self.cfg.top_p,
-            "stream": False,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if self.cfg.max_tokens is not None:
             payload["max_tokens"] = self.cfg.max_tokens
@@ -184,16 +202,43 @@ class OpenAICompletionsClient(TeacherClient):
             f"{self.cfg.base_url.rstrip('/')}/chat/completions",
             json=payload,
             timeout=self.cfg.timeout_s,
+            stream=True,
         )
-        request_seconds = time.monotonic() - started
         response.raise_for_status()
-        data = response.json()
-        usage = data.get("usage") if isinstance(data, dict) else None
-        completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        parts: list[str] = []
+        completion_tokens: int | None = None
+        for raw_line in response.iter_lines(decode_unicode=True):
+            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+            line = str(line or "").strip()
+            if not line.startswith("data:"):
+                continue
+            payload_text = line[5:].strip()
+            if payload_text == "[DONE]":
+                break
+            event = json.loads(payload_text)
+            usage = event.get("usage") if isinstance(event, dict) else None
+            reported = usage.get("completion_tokens") if isinstance(usage, dict) else None
+            if isinstance(reported, int) and reported >= 0:
+                completion_tokens = reported
+            choices = event.get("choices") if isinstance(event, dict) else None
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                continue
+            delta = choices[0].get("delta")
+            content = delta.get("content") if isinstance(delta, dict) else None
+            reasoning = (
+                delta.get("reasoning_content") if isinstance(delta, dict) else None
+            )
+            if isinstance(reasoning, str) and reasoning and on_delta is not None:
+                on_delta(reasoning, time.monotonic())
+            if isinstance(content, str) and content:
+                parts.append(content)
+                if on_delta is not None:
+                    on_delta(content, time.monotonic())
+        request_seconds = time.monotonic() - started
         if not isinstance(completion_tokens, int) or completion_tokens < 0:
             completion_tokens = None
         return _TeacherResponse(
-            _response_text(data),
+            "".join(parts).strip(),
             completion_tokens=completion_tokens,
             request_seconds=request_seconds,
         )
@@ -493,12 +538,31 @@ def _generate_with_retry(
     prompt: str,
     media: dict[str, Any],
     token_counter: Callable[[str], int] = estimate_tokens,
+    throughput: _ThroughputMeter | None = None,
 ) -> _GenerationResult:
     errors: list[str] = []
     for attempt in range(cfg.max_retries + 1):
+        request_id: int | None = None
         try:
             request_started = time.monotonic()
-            raw = client.generate(prompt, media=media)
+            if throughput is not None and isinstance(client, OpenAICompletionsClient):
+                request_id = throughput.begin_request()
+
+                def on_delta(content: str, at: float) -> None:
+                    throughput.record_tokens(
+                        request_id,
+                        at,
+                        max(1, token_counter(content)),
+                    )
+
+                raw = client.generate(prompt, media=media, on_delta=on_delta)
+                throughput.finish_request(
+                    request_id,
+                    getattr(raw, "completion_tokens", None),
+                )
+                request_id = None
+            else:
+                raw = client.generate(prompt, media=media)
             request_finished = time.monotonic()
             text = _validated_teacher_text(
                 str(raw), prompt, cfg.min_estimated_tokens, token_counter
@@ -514,6 +578,8 @@ def _generate_with_retry(
                 generation_seconds=getattr(raw, "generation_seconds", None),
             )
         except (requests.RequestException, ValueError, RuntimeError, OSError) as exc:
+            if throughput is not None and request_id is not None:
+                throughput.cancel_request(request_id)
             errors.append(f"attempt={attempt + 1}: {type(exc).__name__}: {exc}")
             if attempt >= cfg.max_retries:
                 break
@@ -649,7 +715,9 @@ def _generate_records_sync(
         media = dict(prompt_record.get("media") or {})
         prompt = prompt_limiter(prompt, media)
         try:
-            generation = _generate_with_retry(client, cfg, prompt, media, token_counter)
+            generation = _generate_with_retry(
+                client, cfg, prompt, media, token_counter, throughput
+            )
             text = generation.text
         except RuntimeError as exc:
             consecutive_failures += 1
@@ -669,24 +737,12 @@ def _generate_records_sync(
         tok = token_counter(text)
         text_hash = hashlib.sha256(re.sub(r"\s+", " ", text).strip().encode("utf-8")).hexdigest()
         if text_hash in seen_text_hashes:
-            if throughput is not None:
-                throughput.observe(
-                    generation,
-                    fallback_server_tokens=tok,
-                    accepted_dataset_tokens=0,
-                )
             state["filtered_records"] = int(state.get("filtered_records", 0)) + 1
             state["source_index"] = source_index + 1
             state["last_filter_reason"] = "duplicate_teacher_output"
             save_progress(progress_path, state)
             continue
 
-        if throughput is not None:
-            throughput.observe(
-                generation,
-                fallback_server_tokens=tok,
-                accepted_dataset_tokens=tok,
-            )
         metadata = {str(k): v for k, v in dict(prompt_record.get("metadata") or {}).items()}
         metadata.update(
             {
@@ -934,6 +990,7 @@ def _worker_generate(
     prompt: str,
     media: dict[str, Any],
     token_counter: Callable[[str], int],
+    throughput: _ThroughputMeter | None = None,
 ) -> _GenerationResult:
     """Generate in a worker-local client so requests.Session is never shared."""
     client = getattr(_worker_local, "client", None)
@@ -942,7 +999,9 @@ def _worker_generate(
         client = make_client(cfg)
         _worker_local.client = client
         _worker_local.client_cfg_id = id(cfg)
-    return _generate_with_retry(client, cfg, prompt, media, token_counter)
+    return _generate_with_retry(
+        client, cfg, prompt, media, token_counter, throughput
+    )
 
 
 def _generate_records_concurrent(
@@ -1055,7 +1114,14 @@ def _generate_records_concurrent(
                     prompt=prompt,
                     media=media,
                     started=time.time(),
-                    future=executor.submit(_worker_generate, cfg, prompt, media, token_counter),
+                    future=executor.submit(
+                        _worker_generate,
+                        cfg,
+                        prompt,
+                        media,
+                        token_counter,
+                        throughput,
+                    ),
                 )
             )
 
@@ -1119,12 +1185,6 @@ def _generate_records_concurrent(
             tok = token_counter(text)
             text_hash = hashlib.sha256(re.sub(r"\s+", " ", text).strip().encode("utf-8")).hexdigest()
             if text_hash in seen_text_hashes:
-                if throughput is not None:
-                    throughput.observe(
-                        generation,
-                        fallback_server_tokens=tok,
-                        accepted_dataset_tokens=0,
-                    )
                 pending.remove(item)
                 state["filtered_records"] = int(state.get("filtered_records", 0)) + 1
                 state["source_index"] = max(
@@ -1136,12 +1196,6 @@ def _generate_records_concurrent(
                 fill_window()
                 continue
 
-            if throughput is not None:
-                throughput.observe(
-                    generation,
-                    fallback_server_tokens=tok,
-                    accepted_dataset_tokens=tok,
-                )
             metadata = {str(k): v for k, v in dict(item.prompt_record.get("metadata") or {}).items()}
             metadata.update(
                 {
@@ -1527,6 +1581,28 @@ def main() -> None:
     written = 0
     current_tokens = initial_tokens
     throughput = _ThroughputMeter()
+    progress_lock = threading.Lock()
+    progress_stop = threading.Event()
+    progress_fields: dict[str, Any] = {
+        "records": initial_records,
+        "total_tps": "warming",
+    }
+
+    def refresh_throughput() -> None:
+        while not progress_stop.wait(1.0):
+            total_tps = throughput.total_tps()
+            with progress_lock:
+                progress_fields["total_tps"] = (
+                    f"{total_tps:.1f}" if total_tps is not None else "warming"
+                )
+                pbar.set_postfix(progress_fields, refresh=True)
+
+    progress_thread = threading.Thread(
+        target=refresh_throughput,
+        name="teacher-throughput-display",
+        daemon=True,
+    )
+    progress_thread.start()
     try:
         for record in generate_records(
             cfg,
@@ -1540,31 +1616,20 @@ def main() -> None:
             throughput=throughput,
         ):
             _append_record_durable(args.output, record)
-            rates = throughput.snapshot()
-            token_source = "api" if rates["server_tokens_native"] else "student"
-            rate_postfix = {
-                "server_tps": f"{rates['server_tps']:.1f}",
-                "data_tps": f"{rates['dataset_tps']:.1f}",
-                "parallel": f"{rates['observed_concurrency']}/{cfg.concurrency}",
-                "tok_src": token_source,
-            }
             written += 1
             current_tokens += record.estimated_tokens
-            if args.target_estimated_tokens > 0 or args.max_total_records == 0:
-                pbar.update(record.estimated_tokens)
-                pbar.set_postfix({
-                    "records": initial_records + written,
-                    "last_tok": record.estimated_tokens,
-                    **rate_postfix,
-                })
-            else:
-                pbar.update(1)
-                pbar.set_postfix({
-                    "tokens": f"{current_tokens:,}",
-                    "last_tok": record.estimated_tokens,
-                    **rate_postfix,
-                })
+            with progress_lock:
+                progress_fields["records"] = initial_records + written
+                progress_fields["last_tok"] = record.estimated_tokens
+                if args.target_estimated_tokens > 0 or args.max_total_records == 0:
+                    pbar.update(record.estimated_tokens)
+                else:
+                    progress_fields["tokens"] = f"{current_tokens:,}"
+                    pbar.update(1)
+                pbar.set_postfix(progress_fields)
     finally:
+        progress_stop.set()
+        progress_thread.join(timeout=2)
         pbar.close()
     final_state = read_progress(
         args.progress,
