@@ -65,7 +65,7 @@ def validate_numeric_settings(env: Mapping[str, str]) -> tuple[dict[str, Any], l
     val_interval = _integer(env, "DG_VAL_INTERVAL", 500, findings, 1)
     retention = _integer(env, "DG_CHECKPOINT_RETENTION", 3, findings, 1)
     teacher_start_timeout = _integer(env, "DG_TEACHER_START_TIMEOUT_S", 1800, findings, 1)
-    teacher_concurrency = _integer(env, "DG_TEACHER_CONCURRENCY", 8, findings, 1)
+    teacher_concurrency = _integer(env, "DG_TEACHER_CONCURRENCY", 10, findings, 1)
     teacher_tensor_parallel = _integer(
         env, "DG_TEACHER_TENSOR_PARALLEL_SIZE", 1, findings, 1
     )

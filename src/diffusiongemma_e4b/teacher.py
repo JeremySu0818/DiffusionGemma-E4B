@@ -7,6 +7,7 @@ import json
 import math
 import mimetypes
 import os
+import random
 import re
 import sqlite3
 import tempfile
@@ -42,7 +43,7 @@ class TeacherConfig:
     tokenizer_revision: str = ""
     api_key: str = ""
     max_consecutive_failures: int = 20
-    concurrency: int = 8
+    concurrency: int = 10
     prefetch_records: int = 16384
     prefetch_dir: Path | None = None
     student_prefix_length: int = 2048
@@ -594,7 +595,8 @@ def _generate_with_retry(
             errors.append(f"attempt={attempt + 1}: {type(exc).__name__}: {exc}")
             if attempt >= cfg.max_retries:
                 break
-            delay = min(60.0, cfg.retry_base_s * (2**attempt))
+            base_delay = min(60.0, cfg.retry_base_s * (2**attempt))
+            delay = min(60.0, random.uniform(0.5, 1.5) * base_delay) if base_delay > 0 else 0.0
             time.sleep(delay)
     raise RuntimeError("teacher generation failed after retries: " + " | ".join(errors))
 
@@ -742,6 +744,12 @@ def _generate_records_sync(
                 raise RuntimeError(
                     f"teacher failed {consecutive_failures} consecutive prompts; aborting to avoid silent underfill"
                 ) from exc
+            if cfg.retry_base_s > 0:
+                cooldown = min(
+                    30.0,
+                    random.uniform(0.5, 1.5) * cfg.retry_base_s * min(consecutive_failures, 5),
+                )
+                time.sleep(cooldown)
             continue
         consecutive_failures = 0
         state["consecutive_failures"] = 0
@@ -1188,6 +1196,12 @@ def _generate_records_concurrent(
                     raise RuntimeError(
                         f"teacher failed {consecutive_failures} consecutive prompts; aborting to avoid silent underfill"
                     ) from exc
+                if cfg.retry_base_s > 0:
+                    cooldown = min(
+                        30.0,
+                        random.uniform(0.5, 1.5) * cfg.retry_base_s * min(consecutive_failures, 5),
+                    )
+                    time.sleep(cooldown)
                 fill_window()
                 continue
 
@@ -1359,7 +1373,11 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--timeout-s", type=int, default=900)
-    parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=int(os.environ.get("DG_TEACHER_MAX_RETRIES", "5")),
+    )
     parser.add_argument("--retry-base-s", type=float, default=2.0)
     parser.add_argument("--min-estimated-tokens", type=int, default=None)
     parser.add_argument(
@@ -1395,7 +1413,11 @@ def main() -> None:
         default=int(os.environ.get("DG_STREAM_SOURCE_PREFETCH_RECORDS", "64")),
         help="Per-source background row buffer used to hide remote shard latency.",
     )
-    parser.add_argument("--concurrency", type=int, default=int(os.environ.get("DG_TEACHER_CONCURRENCY", "8")))
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=int(os.environ.get("DG_TEACHER_CONCURRENCY", "10")),
+    )
     parser.add_argument(
         "--prefetch-records",
         type=int,

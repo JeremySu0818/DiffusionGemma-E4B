@@ -343,7 +343,7 @@ def test_concurrency_does_not_change_generation_fingerprint():
     many = replace(one, concurrency=8)
 
     assert generation_fingerprint(one, "data") == generation_fingerprint(many, "data")
-    assert TeacherConfig("openai-compatible", "m", "http://x", 1, 0.2, 0.95).concurrency == 8
+    assert TeacherConfig("openai-compatible", "m", "http://x", 1, 0.2, 0.95).concurrency == 10
     assert TeacherConfig("openai-compatible", "m", "http://x", 1, 0.2, 0.95).prefetch_records == 16384
 
 
@@ -453,3 +453,77 @@ def test_generated_mix_rejects_silently_lost_required_bucket():
     }
     with pytest.raises(RuntimeError, match="image"):
         validate_generated_mix(state, config)
+
+
+def test_generate_with_retry_applies_jitter_and_retries(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+
+    class FlakyClient:
+        def __init__(self):
+            self.attempts = 0
+
+        def generate(self, prompt, media=None):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise ValueError("temporary glitch")
+            return "valid answer after retries"
+
+    cfg = TeacherConfig(
+        runtime="openai-compatible",
+        model="m",
+        base_url="http://x",
+        max_tokens=64,
+        temperature=0.2,
+        top_p=0.95,
+        max_retries=3,
+        retry_base_s=2.0,
+        min_estimated_tokens=1,
+    )
+    result = teacher._generate_with_retry(
+        FlakyClient(), cfg, "prompt", {}, token_counter=lambda t: len(t.split())
+    )
+    assert result.text == "valid answer after retries"
+    assert len(sleeps) == 2
+    # Attempt 0: base=2.0, jitter range [1.0, 3.0]
+    assert 1.0 <= sleeps[0] <= 3.0
+    # Attempt 1: base=4.0, jitter range [2.0, 6.0]
+    assert 2.0 <= sleeps[1] <= 6.0
+
+
+def test_consecutive_failure_triggers_cooldown(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+
+    class AlwaysFailingClient:
+        def generate(self, prompt, media=None):
+            raise ValueError("server is down")
+
+    monkeypatch.setattr(teacher, "make_client", lambda _cfg: AlwaysFailingClient())
+    cfg = TeacherConfig(
+        runtime="openai-compatible",
+        model="m",
+        base_url="http://x",
+        max_tokens=64,
+        temperature=0.2,
+        top_p=0.95,
+        max_retries=0,
+        max_consecutive_failures=3,
+        retry_base_s=1.0,
+        concurrency=2,
+        min_estimated_tokens=1,
+    )
+    progress_file = tmp_path / "progress.json"
+    with pytest.raises(RuntimeError, match="failed 3 consecutive prompts"):
+        list(
+            generate_records(
+                cfg,
+                _prompts(10),
+                target_estimated_tokens=0,
+                progress_path=progress_file,
+                token_counter=lambda t: len(t.split()),
+            )
+        )
+    # Consecutive failures should have triggered cooldown sleeps on the scheduler
+    assert any(0.5 <= s <= 15.0 for s in sleeps)
+
