@@ -12,6 +12,7 @@ from diffusiongemma_e4b.data_contract import TeacherSupervisedRecord, write_teac
 from diffusiongemma_e4b import data_sources
 from diffusiongemma_e4b.data_sources import (
     SourceMixError,
+    StreamPauseState,
     _ResilientDatasetIterator,
     _prompt_record,
     iter_prompt_records,
@@ -218,6 +219,42 @@ def test_streaming_dataset_retry_restores_recent_checkpoint(monkeypatch):
     assert opens == 2
     assert loaded_states == [{"position": 1}]
     assert skipped == []
+
+
+def test_streaming_dataset_offline_pause_does_not_consume_retries(monkeypatch):
+    rows = [{"prompt": "available after reconnect"}]
+    opens = 0
+    sleeps: list[float] = []
+    pause_state = StreamPauseState()
+    pause_observations: list[bool] = []
+
+    def open_dataset(_source):
+        nonlocal opens
+        opens += 1
+        if opens <= 2:
+            raise ConnectionError("network is unreachable")
+        return rows
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        pause_observations.append(pause_state.paused)
+
+    monkeypatch.setattr(data_sources, "_open_hf_dataset", open_dataset)
+    monkeypatch.setattr(data_sources.time, "sleep", sleep)
+    iterator = _ResilientDatasetIterator(
+        {"id": "unit/offline-stream"},
+        {
+            "max_retries": 0,
+            "offline_poll_s": 7,
+            "pause_state": pause_state,
+        },
+    )
+
+    assert next(iterator) == rows[0]
+    assert opens == 3
+    assert sleeps == [7, 7]
+    assert pause_observations == [True, True]
+    assert not pause_state.paused
 
 
 def test_parallel_stream_prefetch_bypasses_a_stalled_source(tmp_path, monkeypatch):

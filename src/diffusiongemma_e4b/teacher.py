@@ -24,7 +24,7 @@ from tqdm.auto import tqdm
 
 from .constants import DEFAULT_LMSTUDIO_BASE_URL, DEFAULT_OLLAMA_BASE_URL
 from .data_contract import TeacherSupervisedRecord, iter_jsonl
-from .data_sources import iter_prompt_records
+from .data_sources import StreamPauseState, iter_prompt_records
 
 
 @dataclass
@@ -47,6 +47,7 @@ class TeacherConfig:
     prefetch_records: int = 16384
     prefetch_dir: Path | None = None
     student_prefix_length: int = 2048
+    source_pause_state: StreamPauseState | None = None
 
 
 class TeacherClient:
@@ -524,14 +525,12 @@ _ENDPOINT_FAILURE_RE = re.compile(
 def _validated_teacher_text(
     text: str,
     prompt: str,
-    min_estimated_tokens: int,
-    token_counter: Callable[[str], int] = estimate_tokens,
+    _min_estimated_tokens: int,
+    _token_counter: Callable[[str], int] = estimate_tokens,
 ) -> str:
     text = text.strip()
     if not text:
         raise ValueError("teacher returned empty text")
-    if token_counter(text) < min_estimated_tokens:
-        raise ValueError(f"teacher output is shorter than {min_estimated_tokens} estimated tokens")
     normalized = re.sub(r"\s+", " ", text).strip().casefold()
     prompt_normalized = re.sub(r"\s+", " ", prompt).strip().casefold()
     if normalized == prompt_normalized:
@@ -1004,6 +1003,73 @@ class _DiskPromptQueue:
         self._reader.close()
 
 
+def _iter_disk_spooled_prompts(
+    cfg: TeacherConfig,
+    prompt_records: Iterable[dict[str, Any]],
+    progress_path: Path,
+    fingerprint: str,
+) -> Iterable[dict[str, Any]]:
+    """Prefetch prompts to SQLite while preserving main-thread generation."""
+    prefetch_size = max(cfg.prefetch_records, 2)
+    spool_root = cfg.prefetch_dir or progress_path.parent / "prompt_spool"
+    source_queue = _DiskPromptQueue(
+        Path(spool_root), max_records=prefetch_size, fingerprint=fingerprint
+    )
+    source_stop = threading.Event()
+
+    def prefetch() -> None:
+        source_items = enumerate(iter(prompt_records))
+        error: BaseException | None = None
+        try:
+            for source_index, prompt_record in source_items:
+                if not source_queue.put(source_index, prompt_record, source_stop):
+                    return
+        except BaseException as exc:
+            error = exc
+        finally:
+            close = getattr(source_items, "close", None)
+            if callable(close):
+                close()
+            source_queue.finish(error)
+
+    producer = threading.Thread(
+        target=prefetch,
+        name="teacher-prompt-prefetch",
+        daemon=True,
+    )
+    producer.start()
+    last_source_activity = time.monotonic()
+    try:
+        while True:
+            item = source_queue.get(timeout=0.1)
+            if item is None:
+                if source_queue.exhausted:
+                    break
+                source_is_offline = bool(
+                    cfg.source_pause_state is not None and cfg.source_pause_state.paused
+                )
+                if (
+                    not source_is_offline
+                    and time.monotonic() - last_source_activity
+                    >= _PROMPT_PREFETCH_STALL_TIMEOUT_S
+                ):
+                    raise RuntimeError(
+                        "prompt source prefetch stalled for "
+                        f"{_PROMPT_PREFETCH_STALL_TIMEOUT_S:g}s; no new prompt was available"
+                    )
+                continue
+            _, prompt_record = item
+            prompt_key = str(prompt_record.get("id") or _sha256_json(prompt_record))
+            last_source_activity = time.monotonic()
+            yield prompt_record
+            source_queue.acknowledge(prompt_key)
+    finally:
+        source_stop.set()
+        producer.join(timeout=0.2)
+        source_queue.requeue_inflight()
+        source_queue.close()
+
+
 def _worker_generate(
     cfg: TeacherConfig,
     prompt: str,
@@ -1150,14 +1216,20 @@ def _generate_records_concurrent(
             if not pending:
                 if source_exhausted:
                     break
-                if time.monotonic() - last_source_activity >= _PROMPT_PREFETCH_STALL_TIMEOUT_S:
+                source_is_offline = bool(
+                    cfg.source_pause_state is not None and cfg.source_pause_state.paused
+                )
+                if (
+                    not source_is_offline
+                    and time.monotonic() - last_source_activity >= _PROMPT_PREFETCH_STALL_TIMEOUT_S
+                ):
                     raise RuntimeError(
                         "prompt source prefetch stalled for "
                         f"{_PROMPT_PREFETCH_STALL_TIMEOUT_S:g}s; no new prompt was available"
                     )
-                # There is no LM request to service, so a short bounded wait
-                # is appropriate.  It is repeated only until the explicit
-                # stall timeout above, rather than forever.
+                # There is no LM request to service, so use a short wait. The
+                # ordinary stall deadline remains active unless the source has
+                # explicitly reported an offline pause.
                 fill_window(wait_s=0.1)
                 continue
 
@@ -1321,10 +1393,17 @@ def generate_records(
         raise ValueError("teacher concurrency must be at least 1")
     if cfg.prefetch_records < 1:
         raise ValueError("teacher prefetch_records must be at least 1")
-    implementation = _generate_records_sync if cfg.concurrency == 1 else _generate_records_concurrent
+    implementation = _generate_records_concurrent
+    records = prompt_records
+    if cfg.concurrency == 1:
+        # Preserve main-thread client execution while allowing the dataset
+        # producer to keep the durable SQLite reservoir full.
+        fingerprint = generation_fingerprint(cfg, data_fingerprint)
+        records = _iter_disk_spooled_prompts(cfg, prompt_records, progress_path, fingerprint)
+        implementation = _generate_records_sync
     yield from implementation(
         cfg,
-        prompt_records,
+        records,
         target_estimated_tokens,
         progress_path,
         output_path,
@@ -1379,7 +1458,15 @@ def main() -> None:
         default=int(os.environ.get("DG_TEACHER_MAX_RETRIES", "5")),
     )
     parser.add_argument("--retry-base-s", type=float, default=2.0)
-    parser.add_argument("--min-estimated-tokens", type=int, default=None)
+    parser.add_argument(
+        "--min-estimated-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Deprecated resume-compatibility option; short non-empty teacher outputs "
+            "are accepted."
+        ),
+    )
     parser.add_argument(
         "--tokenizer",
         default=os.environ.get("DG_STUDENT_MODEL", "google/gemma-4-E4B-it"),
@@ -1400,6 +1487,15 @@ def main() -> None:
         "--stream-retry-max-s",
         type=float,
         default=float(os.environ.get("DG_STREAM_RETRY_MAX_S", "60")),
+    )
+    parser.add_argument(
+        "--stream-offline-poll-s",
+        type=float,
+        default=float(os.environ.get("DG_STREAM_OFFLINE_POLL_S", "30")),
+        help=(
+            "Seconds between connectivity checks while offline. Offline waits do not "
+            "consume the stream retry budget."
+        ),
     )
     parser.add_argument(
         "--stream-checkpoint-rows",
@@ -1443,6 +1539,7 @@ def main() -> None:
 
     source_config: dict[str, Any] | None = None
     mix_validation_config: dict[str, Any] | None = None
+    source_pause_state: StreamPauseState | None = None
     if args.input_jsonl is not None:
         if not args.input_jsonl.is_file():
             raise FileNotFoundError(args.input_jsonl)
@@ -1456,6 +1553,7 @@ def main() -> None:
         prompt_records = iter_jsonl(args.input_jsonl)
         configured_min_tokens = 8
     else:
+        source_pause_state = StreamPauseState()
         source_config = json.loads(args.source_config.read_text(encoding="utf-8"))
         source_names = {item.strip() for item in args.sources.split(",") if item.strip()} or None
         selected_sources = [
@@ -1501,6 +1599,8 @@ def main() -> None:
                 "base_s": args.stream_retry_base_s,
                 "max_s": args.stream_retry_max_s,
                 "checkpoint_rows": args.stream_checkpoint_rows,
+                "offline_poll_s": args.stream_offline_poll_s,
+                "pause_state": source_pause_state,
             },
             source_prefetch_records=args.stream_source_prefetch_records,
         )
@@ -1576,6 +1676,7 @@ def main() -> None:
         prefetch_records=args.prefetch_records,
         prefetch_dir=args.prefetch_dir,
         student_prefix_length=args.student_prefix_length,
+        source_pause_state=source_pause_state,
     )
     _repair_jsonl_tail(args.output)
     initial_state = read_progress(args.progress, output_path=args.output)

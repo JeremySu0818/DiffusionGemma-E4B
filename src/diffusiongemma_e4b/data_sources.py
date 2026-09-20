@@ -28,6 +28,30 @@ class SourceStreamError(SourceMixError):
     """Raised when a dataset stream cannot recover without changing its data mix."""
 
 
+class StreamPauseState:
+    """Thread-safe visibility into sources paused by a network outage."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._paused: dict[str, str] = {}
+
+    def pause(self, source_id: str, error: BaseException) -> bool:
+        """Mark a source paused and return True only for the first notification."""
+        with self._lock:
+            first = source_id not in self._paused
+            self._paused[source_id] = f"{type(error).__name__}: {error}"
+            return first
+
+    def resume(self, source_id: str) -> bool:
+        with self._lock:
+            return self._paused.pop(source_id, None) is not None
+
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return bool(self._paused)
+
+
 def _as_text(value: Any) -> str:
     if value is None:
         return ""
@@ -368,6 +392,32 @@ def _is_transient_stream_error(exc: BaseException) -> bool:
     return any(token in name for token in ("connection", "timeout", "ratelimit"))
 
 
+def _is_offline_stream_error(exc: BaseException) -> bool:
+    """Return whether retry limits should be suspended until connectivity returns."""
+    if _http_status(exc) is not None:
+        return False
+    if isinstance(exc, OSError):
+        if exc.errno in {
+            errno.EHOSTUNREACH,
+            errno.ENETDOWN,
+            errno.ENETUNREACH,
+        }:
+            return True
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return "gaierror" in name or any(
+        token in message
+        for token in (
+            "network is unreachable",
+            "no route to host",
+            "name or service not known",
+            "nodename nor servname provided",
+            "temporary failure in name resolution",
+            "failed to resolve",
+        )
+    )
+
+
 class _ResilientDatasetIterator:
     def __init__(self, source: dict[str, Any], retry_config: dict[str, Any] | None = None):
         self.source = source
@@ -381,11 +431,14 @@ class _ResilientDatasetIterator:
         self.retry_base_s = float(retry_config.get("base_s", 2.0))
         self.retry_max_s = float(retry_config.get("max_s", 60.0))
         self.checkpoint_rows = int(retry_config.get("checkpoint_rows", 256))
+        self.offline_poll_s = float(retry_config.get("offline_poll_s", 30.0))
+        self.pause_state = retry_config.get("pause_state") or StreamPauseState()
         if (
             self.max_retries < 0
             or self.retry_base_s < 0
             or self.retry_max_s < 0
             or self.checkpoint_rows < 0
+            or self.offline_poll_s < 0
         ):
             raise ValueError("stream retry settings must be non-negative")
 
@@ -449,26 +502,55 @@ class _ResilientDatasetIterator:
 
     def __next__(self) -> dict[str, Any]:
         errors: list[str] = []
-        for attempt in range(self.max_retries + 1):
+        attempt = 0
+        source_id = str(self.source["id"])
+        while attempt <= self.max_retries:
             try:
                 if self.iterator is None:
                     self._reopen()
                 assert self.iterator is not None
                 row = next(self.iterator)
+                if (
+                    isinstance(self.pause_state, StreamPauseState)
+                    and self.pause_state.resume(source_id)
+                ):
+                    print(
+                        f"network restored; resuming streaming dataset {source_id} "
+                        f"from row {self.rows_read}",
+                        file=sys.stderr,
+                    )
                 self.rows_read += 1
                 self._checkpoint()
                 return row
             except StopIteration:
+                if isinstance(self.pause_state, StreamPauseState):
+                    self.pause_state.resume(source_id)
                 raise
             except Exception as exc:  # noqa: BLE001
+                self.dataset = None
+                self.iterator = None
+                if _is_offline_stream_error(exc):
+                    first_pause = False
+                    if isinstance(self.pause_state, StreamPauseState):
+                        first_pause = self.pause_state.pause(source_id, exc)
+                    if first_pause:
+                        print(
+                            f"network unavailable; pausing streaming dataset {source_id} at "
+                            f"row {self.rows_read}. Disk-spooled prompts remain available; "
+                            f"checking again in {self.offline_poll_s:g}s",
+                            file=sys.stderr,
+                        )
+                    time.sleep(self.offline_poll_s)
+                    # Connectivity failures are an availability pause, not a
+                    # dataset failure. They must not consume the retry budget
+                    # or let callers quarantine an otherwise valid source.
+                    continue
                 if not _is_transient_stream_error(exc):
                     raise SourceStreamError(
                         f"streaming dataset {self.source['id']} failed permanently at row "
                         f"{self.rows_read}: {type(exc).__name__}: {exc}"
                     ) from exc
                 errors.append(f"attempt={attempt + 1}: {type(exc).__name__}: {exc}")
-                self.dataset = None
-                self.iterator = None
                 if attempt >= self.max_retries:
                     break
                 ceiling = min(self.retry_max_s, self.retry_base_s * (2**attempt))
@@ -479,6 +561,7 @@ class _ResilientDatasetIterator:
                     file=sys.stderr,
                 )
                 time.sleep(delay)
+                attempt += 1
         raise SourceStreamError(
             f"streaming dataset {self.source['id']} exhausted {self.max_retries} retries at "
             f"row {self.rows_read}; refusing to silently remove the source: {' | '.join(errors)}"
@@ -901,6 +984,12 @@ def main() -> None:
         default=float(os.environ.get("DG_STREAM_RETRY_MAX_S", "60")),
     )
     parser.add_argument(
+        "--stream-offline-poll-s",
+        type=float,
+        default=float(os.environ.get("DG_STREAM_OFFLINE_POLL_S", "30")),
+        help="Seconds between connectivity checks while a dataset stream is offline.",
+    )
+    parser.add_argument(
         "--stream-checkpoint-rows",
         type=int,
         default=int(os.environ.get("DG_STREAM_CHECKPOINT_ROWS", "256")),
@@ -926,6 +1015,7 @@ def main() -> None:
             "base_s": args.stream_retry_base_s,
             "max_s": args.stream_retry_max_s,
             "checkpoint_rows": args.stream_checkpoint_rows,
+            "offline_poll_s": args.stream_offline_poll_s,
         },
         source_prefetch_records=args.stream_source_prefetch_records,
     )

@@ -155,6 +155,35 @@ def test_slow_prompt_prefetch_does_not_block_completed_requests(tmp_path, monkey
     assert elapsed < 1
 
 
+def test_single_worker_still_prefetches_prompts_to_disk(tmp_path, monkeypatch):
+    source_prefetched = threading.Event()
+
+    def prompt_stream():
+        yield from _prompts(3)
+        source_prefetched.set()
+
+    class Client:
+        def generate(self, prompt, media=None):
+            assert source_prefetched.wait(timeout=1)
+            return f"unique answer for {prompt}"
+
+    monkeypatch.setattr(teacher, "make_client", lambda _cfg: Client())
+    cfg = replace(_cfg(1), prefetch_dir=tmp_path / "spool")
+    records = list(
+        generate_records(
+            cfg,
+            prompt_stream(),
+            0,
+            tmp_path / "progress.json",
+            data_fingerprint="single-worker-spool",
+            token_counter=lambda _text: 4,
+        )
+    )
+
+    assert [record.metadata["prompt_record_id"] for record in records] == ["p0", "p1", "p2"]
+    assert list((tmp_path / "spool").glob("prompts-*.sqlite3"))
+
+
 def test_newly_spooled_prompts_fill_idle_slots_before_first_request_finishes(
     tmp_path, monkeypatch
 ):
@@ -491,6 +520,56 @@ def test_generate_with_retry_applies_jitter_and_retries(monkeypatch):
     assert 2.0 <= sleeps[1] <= 6.0
 
 
+def test_short_nonempty_teacher_output_is_accepted_without_retry(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    class ShortClient:
+        attempts = 0
+
+        def generate(self, prompt, media=None):
+            self.attempts += 1
+            return "OK"
+
+    client = ShortClient()
+    result = teacher._generate_with_retry(
+        client,
+        replace(_cfg(1), max_retries=5, min_estimated_tokens=8),
+        "prompt",
+        {},
+        token_counter=lambda _text: 1,
+    )
+
+    assert result.text == "OK"
+    assert client.attempts == 1
+    assert sleeps == []
+
+
+def test_empty_teacher_output_is_retried_and_contained(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    class EmptyThenValidClient:
+        attempts = 0
+
+        def generate(self, prompt, media=None):
+            self.attempts += 1
+            return "   " if self.attempts == 1 else "OK"
+
+    client = EmptyThenValidClient()
+    result = teacher._generate_with_retry(
+        client,
+        replace(_cfg(1), max_retries=2, retry_base_s=0, min_estimated_tokens=8),
+        "prompt",
+        {},
+        token_counter=lambda _text: 1,
+    )
+
+    assert result.text == "OK"
+    assert client.attempts == 2
+    assert sleeps == [0.0]
+
+
 def test_consecutive_failure_triggers_cooldown(tmp_path, monkeypatch):
     sleeps = []
     monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
@@ -526,4 +605,3 @@ def test_consecutive_failure_triggers_cooldown(tmp_path, monkeypatch):
         )
     # Consecutive failures should have triggered cooldown sleeps on the scheduler
     assert any(0.5 <= s <= 15.0 for s in sleeps)
-
