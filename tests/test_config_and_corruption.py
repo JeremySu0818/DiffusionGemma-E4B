@@ -14,6 +14,8 @@ from diffusiongemma_e4b.data_sources import (
     SourceMixError,
     StreamPauseState,
     _ResilientDatasetIterator,
+    _configure_streaming_network_retries,
+    _is_offline_stream_error,
     _prompt_record,
     iter_prompt_records,
 )
@@ -224,37 +226,123 @@ def test_streaming_dataset_retry_restores_recent_checkpoint(monkeypatch):
 def test_streaming_dataset_offline_pause_does_not_consume_retries(monkeypatch):
     rows = [{"prompt": "available after reconnect"}]
     opens = 0
-    sleeps: list[float] = []
+    probes = 0
     pause_state = StreamPauseState()
-    pause_observations: list[bool] = []
 
     def open_dataset(_source):
         nonlocal opens
         opens += 1
-        if opens <= 2:
+        if opens == 1:
             raise ConnectionError("network is unreachable")
         return rows
 
-    def sleep(seconds):
-        sleeps.append(seconds)
-        pause_observations.append(pause_state.paused)
+    def connectivity_probe():
+        nonlocal probes
+        probes += 1
+        return probes >= 3
 
     monkeypatch.setattr(data_sources, "_open_hf_dataset", open_dataset)
-    monkeypatch.setattr(data_sources.time, "sleep", sleep)
     iterator = _ResilientDatasetIterator(
         {"id": "unit/offline-stream"},
         {
             "max_retries": 0,
-            "offline_poll_s": 7,
+            "offline_poll_s": 0,
             "pause_state": pause_state,
+            "connectivity_probe": connectivity_probe,
         },
     )
 
     assert next(iterator) == rows[0]
-    assert opens == 3
-    assert sleeps == [7, 7]
-    assert pause_observations == [True, True]
+    assert opens == 2
+    assert probes == 3
     assert not pause_state.paused
+
+
+def test_streaming_sources_share_one_connectivity_probe():
+    pause_state = StreamPauseState()
+    pause_state.pause("unit/first", ConnectionError("network is unreachable"), 0)
+    probe_calls = 0
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+
+    def connectivity_probe():
+        nonlocal probe_calls
+        probe_calls += 1
+        probe_started.set()
+        release_probe.wait(timeout=2)
+        return True
+
+    restored: list[bool] = []
+
+    def wait_for_network():
+        restored.append(pause_state.wait_until_online(connectivity_probe, 0))
+
+    threads = [threading.Thread(target=wait_for_network) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    assert probe_started.wait(timeout=2)
+    release_probe.set()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert probe_calls == 1
+    assert restored.count(True) == 1
+    assert restored.count(False) == 7
+    assert not pause_state.paused
+
+
+def test_streaming_dataset_disables_library_inner_download_retries(monkeypatch):
+    from datasets.utils import file_utils as datasets_file_utils
+    from huggingface_hub import file_download, hf_file_system
+
+    observed: dict[str, int] = {}
+
+    def http_get(*_args, **kwargs):
+        observed["http_get_retries"] = kwargs.get("_nb_retries")
+
+    @data_sources.contextlib.contextmanager
+    def download_stream_backoff(*_args, **kwargs):
+        observed["download_stream_retries"] = kwargs.get("max_retries")
+        yield object()
+
+    @data_sources.contextlib.contextmanager
+    def filesystem_stream_backoff(*_args, **kwargs):
+        observed["filesystem_stream_retries"] = kwargs.get("max_retries")
+        yield object()
+
+    monkeypatch.setattr(file_download, "http_get", http_get)
+    monkeypatch.setattr(file_download, "http_stream_backoff", download_stream_backoff)
+    monkeypatch.setattr(hf_file_system, "http_stream_backoff", filesystem_stream_backoff)
+
+    def add_read_retries(file_obj):
+        raise AssertionError("datasets retry wrapper should be replaced")
+
+    monkeypatch.setattr(
+        datasets_file_utils, "_add_retries_to_file_obj_read_method", add_read_retries
+    )
+
+    _configure_streaming_network_retries()
+    file_download.http_get("url", object())
+    with file_download.http_stream_backoff("GET", "url"):
+        pass
+    with hf_file_system.http_stream_backoff("GET", "url"):
+        pass
+    raw_file = object()
+    assert datasets_file_utils._add_retries_to_file_obj_read_method(raw_file) is raw_file
+
+    assert observed == {
+        "http_get_retries": 0,
+        "download_stream_retries": 0,
+        "filesystem_stream_retries": 0,
+    }
+
+
+def test_streaming_dataset_recognizes_wrapped_dns_failure_as_offline():
+    dns_error = OSError(-3, "Temporary failure in name resolution")
+    try:
+        raise ConnectionError("Server Disconnected") from dns_error
+    except ConnectionError as wrapped:
+        assert _is_offline_stream_error(wrapped)
 
 
 def test_parallel_stream_prefetch_bypasses_a_stalled_source(tmp_path, monkeypatch):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import errno
 import hashlib
@@ -11,6 +12,7 @@ import os
 import queue
 import re
 import random
+import socket
 import sys
 import tempfile
 import threading
@@ -18,6 +20,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+from urllib.parse import urlparse
 
 
 class SourceMixError(RuntimeError):
@@ -29,27 +32,78 @@ class SourceStreamError(SourceMixError):
 
 
 class StreamPauseState:
-    """Thread-safe visibility into sources paused by a network outage."""
+    """A shared connectivity gate for every remote dataset source."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
         self._paused: dict[str, str] = {}
+        self._offline = False
+        self._probing = False
+        self._next_probe_at = 0.0
 
-    def pause(self, source_id: str, error: BaseException) -> bool:
-        """Mark a source paused and return True only for the first notification."""
-        with self._lock:
-            first = source_id not in self._paused
+    def pause(self, source_id: str, error: BaseException, poll_s: float = 30.0) -> bool:
+        """Close the global gate and return True only for the first notification."""
+        with self._condition:
+            first = not self._offline
+            self._offline = True
             self._paused[source_id] = f"{type(error).__name__}: {error}"
+            if first:
+                self._next_probe_at = time.monotonic() + poll_s
+            self._condition.notify_all()
             return first
 
-    def resume(self, source_id: str) -> bool:
-        with self._lock:
-            return self._paused.pop(source_id, None) is not None
+    def wait_until_online(
+        self,
+        probe: Any,
+        poll_s: float,
+    ) -> bool:
+        """Block all readers while one elected reader performs silent probes."""
+        while True:
+            with self._condition:
+                if not self._offline:
+                    return False
+                now = time.monotonic()
+                if self._probing:
+                    self._condition.wait()
+                    continue
+                if now < self._next_probe_at:
+                    self._condition.wait(timeout=self._next_probe_at - now)
+                    continue
+                self._probing = True
+
+            try:
+                online = bool(probe())
+            except Exception:  # A connectivity probe must never kill generation.
+                online = False
+
+            with self._condition:
+                self._probing = False
+                if online:
+                    self._offline = False
+                    self._paused.clear()
+                    self._next_probe_at = 0.0
+                    self._condition.notify_all()
+                    return True
+                self._next_probe_at = time.monotonic() + poll_s
+                self._condition.notify_all()
 
     @property
     def paused(self) -> bool:
-        with self._lock:
-            return bool(self._paused)
+        with self._condition:
+            return self._offline
+
+
+def _hf_connectivity_probe(timeout_s: float = 3.0) -> bool:
+    """Check DNS and TCP reachability without issuing a noisy Hub request."""
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+    parsed = urlparse(endpoint if "://" in endpoint else f"https://{endpoint}")
+    host = parsed.hostname or "huggingface.co"
+    port = parsed.port or (80 if parsed.scheme == "http" else 443)
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
 
 
 def _as_text(value: Any) -> str:
@@ -362,6 +416,79 @@ def _open_hf_dataset(source: dict[str, Any]) -> Any:
     return load_dataset(source["id"], config, **kwargs) if config else load_dataset(source["id"], **kwargs)
 
 
+_STREAM_RETRY_CONFIG_LOCK = threading.Lock()
+
+
+def _configure_streaming_network_retries() -> None:
+    """Route network failures directly to our offline-pause policy.
+
+    Hugging Face Hub and datasets both install their own retry loops.  The
+    wrappers are process-wide because dataset reads happen concurrently; a
+    temporary monkey-patch can be restored by one source while another source
+    is still reading.
+    """
+
+    with _STREAM_RETRY_CONFIG_LOCK:
+        try:
+            from datasets.utils import file_utils as datasets_file_utils
+
+            # datasets wraps every streaming file object's read() with 20
+            # retries. Bypass that wrapper so the original read still happens
+            # once and any failure reaches this iterator immediately.
+            add_read_retries = getattr(
+                datasets_file_utils, "_add_retries_to_file_obj_read_method", None
+            )
+            if callable(add_read_retries) and not getattr(
+                add_read_retries, "_dg_no_retry", False
+            ):
+                def leave_read_unwrapped(file_obj: Any) -> Any:
+                    return file_obj
+
+                leave_read_unwrapped._dg_no_retry = True  # type: ignore[attr-defined]
+                datasets_file_utils._add_retries_to_file_obj_read_method = (
+                    leave_read_unwrapped
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            from huggingface_hub import file_download, hf_file_system
+        except Exception:  # noqa: BLE001
+            return
+
+        def patch_http_get(module: Any) -> None:
+            original = getattr(module, "http_get", None)
+            if not callable(original) or getattr(original, "_dg_no_retry", False):
+                return
+
+            def http_get_no_retry(*args: Any, **kwargs: Any) -> Any:
+                kwargs["_nb_retries"] = 0
+                return original(*args, **kwargs)
+
+            http_get_no_retry._dg_no_retry = True  # type: ignore[attr-defined]
+            module.http_get = http_get_no_retry
+
+        def patch_http_stream_backoff(module: Any) -> None:
+            original = getattr(module, "http_stream_backoff", None)
+            if not callable(original) or getattr(original, "_dg_no_retry", False):
+                return
+
+            @contextlib.contextmanager
+            def http_stream_backoff_no_retry(*args: Any, **kwargs: Any) -> Iterator[Any]:
+                kwargs["max_retries"] = 0
+                with original(*args, **kwargs) as response:
+                    yield response
+
+            http_stream_backoff_no_retry._dg_no_retry = True  # type: ignore[attr-defined]
+            module.http_stream_backoff = http_stream_backoff_no_retry
+
+        patch_http_get(file_download)
+        # Streaming parquet reads use the function imported directly into
+        # hf_file_system, while regular downloads use file_download's copy.
+        patch_http_stream_backoff(file_download)
+        patch_http_stream_backoff(hf_file_system)
+
+
 def _http_status(exc: BaseException) -> int | None:
     status = getattr(exc, "status_code", None)
     if status is None:
@@ -394,32 +521,39 @@ def _is_transient_stream_error(exc: BaseException) -> bool:
 
 def _is_offline_stream_error(exc: BaseException) -> bool:
     """Return whether retry limits should be suspended until connectivity returns."""
-    if _http_status(exc) is not None:
-        return False
-    if isinstance(exc, OSError):
-        if exc.errno in {
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _http_status(current) is not None:
+            return False
+        if isinstance(current, OSError) and current.errno in {
             errno.EHOSTUNREACH,
             errno.ENETDOWN,
             errno.ENETUNREACH,
         }:
             return True
-    name = type(exc).__name__.lower()
-    message = str(exc).lower()
-    return "gaierror" in name or any(
-        token in message
-        for token in (
-            "network is unreachable",
-            "no route to host",
-            "name or service not known",
-            "nodename nor servname provided",
-            "temporary failure in name resolution",
-            "failed to resolve",
-        )
-    )
+        name = type(current).__name__.lower()
+        message = str(current).lower()
+        if "gaierror" in name or any(
+            token in message
+            for token in (
+                "network is unreachable",
+                "no route to host",
+                "name or service not known",
+                "nodename nor servname provided",
+                "temporary failure in name resolution",
+                "failed to resolve",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class _ResilientDatasetIterator:
     def __init__(self, source: dict[str, Any], retry_config: dict[str, Any] | None = None):
+        _configure_streaming_network_retries()
         self.source = source
         self.rows_read = 0
         self.dataset: Any | None = None
@@ -433,6 +567,7 @@ class _ResilientDatasetIterator:
         self.checkpoint_rows = int(retry_config.get("checkpoint_rows", 256))
         self.offline_poll_s = float(retry_config.get("offline_poll_s", 30.0))
         self.pause_state = retry_config.get("pause_state") or StreamPauseState()
+        self.connectivity_probe = retry_config.get("connectivity_probe") or _hf_connectivity_probe
         if (
             self.max_retries < 0
             or self.retry_base_s < 0
@@ -506,25 +641,24 @@ class _ResilientDatasetIterator:
         source_id = str(self.source["id"])
         while attempt <= self.max_retries:
             try:
+                if (
+                    isinstance(self.pause_state, StreamPauseState)
+                    and self.pause_state.wait_until_online(
+                        self.connectivity_probe, self.offline_poll_s
+                    )
+                ):
+                    print(
+                        "network restored; resuming all streaming datasets",
+                        file=sys.stderr,
+                    )
                 if self.iterator is None:
                     self._reopen()
                 assert self.iterator is not None
                 row = next(self.iterator)
-                if (
-                    isinstance(self.pause_state, StreamPauseState)
-                    and self.pause_state.resume(source_id)
-                ):
-                    print(
-                        f"network restored; resuming streaming dataset {source_id} "
-                        f"from row {self.rows_read}",
-                        file=sys.stderr,
-                    )
                 self.rows_read += 1
                 self._checkpoint()
                 return row
             except StopIteration:
-                if isinstance(self.pause_state, StreamPauseState):
-                    self.pause_state.resume(source_id)
                 raise
             except Exception as exc:  # noqa: BLE001
                 self.dataset = None
@@ -532,15 +666,16 @@ class _ResilientDatasetIterator:
                 if _is_offline_stream_error(exc):
                     first_pause = False
                     if isinstance(self.pause_state, StreamPauseState):
-                        first_pause = self.pause_state.pause(source_id, exc)
+                        first_pause = self.pause_state.pause(
+                            source_id, exc, self.offline_poll_s
+                        )
                     if first_pause:
                         print(
-                            f"network unavailable; pausing streaming dataset {source_id} at "
-                            f"row {self.rows_read}. Disk-spooled prompts remain available; "
-                            f"checking again in {self.offline_poll_s:g}s",
+                            "network unavailable; pausing all streaming datasets. "
+                            "Disk-spooled prompts remain available; a single silent "
+                            f"connectivity probe will run every {self.offline_poll_s:g}s",
                             file=sys.stderr,
                         )
-                    time.sleep(self.offline_poll_s)
                     # Connectivity failures are an availability pause, not a
                     # dataset failure. They must not consume the retry budget
                     # or let callers quarantine an otherwise valid source.
