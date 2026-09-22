@@ -600,6 +600,27 @@ def _generate_with_retry(
     raise RuntimeError("teacher generation failed after retries: " + " | ".join(errors))
 
 
+def _cool_down_after_failure_streak(
+    cfg: TeacherConfig,
+    state: dict[str, Any],
+    consecutive_failures: int,
+) -> int:
+    """Apply backpressure after repeated failures without aborting generation."""
+    threshold = max(1, cfg.max_consecutive_failures)
+    if consecutive_failures < threshold:
+        return consecutive_failures
+
+    state["failure_cooldowns"] = int(state.get("failure_cooldowns", 0)) + 1
+    state["consecutive_failures"] = 0
+    if cfg.retry_base_s > 0:
+        cooldown = min(
+            30.0,
+            random.uniform(0.5, 1.5) * cfg.retry_base_s * min(threshold, 5),
+        )
+        time.sleep(cooldown)
+    return 0
+
+
 def _existing_output_sets(output_path: Path | None) -> tuple[set[str], set[str]]:
     prompt_ids: set[str] = set()
     text_hashes: set[str] = set()
@@ -738,17 +759,10 @@ def _generate_records_sync(
             state["source_index"] = source_index + 1
             state["last_failed_prompt_id"] = prompt_record_id
             state["last_failure"] = str(exc)
+            consecutive_failures = _cool_down_after_failure_streak(
+                cfg, state, consecutive_failures
+            )
             save_progress(progress_path, state)
-            if consecutive_failures >= cfg.max_consecutive_failures:
-                raise RuntimeError(
-                    f"teacher failed {consecutive_failures} consecutive prompts; aborting to avoid silent underfill"
-                ) from exc
-            if cfg.retry_base_s > 0:
-                cooldown = min(
-                    30.0,
-                    random.uniform(0.5, 1.5) * cfg.retry_base_s * min(consecutive_failures, 5),
-                )
-                time.sleep(cooldown)
             continue
         consecutive_failures = 0
         state["consecutive_failures"] = 0
@@ -1262,18 +1276,11 @@ def _generate_records_concurrent(
                 )
                 state["last_failed_prompt_id"] = item.prompt_record_id
                 state["last_failure"] = str(exc)
-                save_progress(progress_path, state)
                 source_queue.acknowledge(item.prompt_record_id)
-                if consecutive_failures >= cfg.max_consecutive_failures:
-                    raise RuntimeError(
-                        f"teacher failed {consecutive_failures} consecutive prompts; aborting to avoid silent underfill"
-                    ) from exc
-                if cfg.retry_base_s > 0:
-                    cooldown = min(
-                        30.0,
-                        random.uniform(0.5, 1.5) * cfg.retry_base_s * min(consecutive_failures, 5),
-                    )
-                    time.sleep(cooldown)
+                consecutive_failures = _cool_down_after_failure_streak(
+                    cfg, state, consecutive_failures
+                )
+                save_progress(progress_path, state)
                 fill_window()
                 continue
 
@@ -1472,7 +1479,15 @@ def main() -> None:
         default=os.environ.get("DG_STUDENT_MODEL", "google/gemma-4-E4B-it"),
     )
     parser.add_argument("--api-key-env", default="DG_TEACHER_API_KEY")
-    parser.add_argument("--max-consecutive-failures", type=int, default=20)
+    parser.add_argument(
+        "--max-consecutive-failures",
+        type=int,
+        default=20,
+        help=(
+            "Failed prompts before a circuit-breaker cooldown. Exhausted requests "
+            "are recorded and skipped; generation continues."
+        ),
+    )
     parser.add_argument(
         "--stream-max-retries",
         type=int,

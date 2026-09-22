@@ -570,7 +570,8 @@ def test_empty_teacher_output_is_retried_and_contained(monkeypatch):
     assert sleeps == [0.0]
 
 
-def test_consecutive_failure_triggers_cooldown(tmp_path, monkeypatch):
+@pytest.mark.parametrize("concurrency", [1, 2])
+def test_consecutive_failures_cool_down_and_continue(tmp_path, monkeypatch, concurrency):
     sleeps = []
     monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
 
@@ -589,11 +590,11 @@ def test_consecutive_failure_triggers_cooldown(tmp_path, monkeypatch):
         max_retries=0,
         max_consecutive_failures=3,
         retry_base_s=1.0,
-        concurrency=2,
+        concurrency=concurrency,
         min_estimated_tokens=1,
     )
     progress_file = tmp_path / "progress.json"
-    with pytest.raises(RuntimeError, match="failed 3 consecutive prompts"):
+    assert (
         list(
             generate_records(
                 cfg,
@@ -603,5 +604,12 @@ def test_consecutive_failure_triggers_cooldown(tmp_path, monkeypatch):
                 token_counter=lambda t: len(t.split()),
             )
         )
-    # Consecutive failures should have triggered cooldown sleeps on the scheduler
-    assert any(0.5 <= s <= 15.0 for s in sleeps)
+        == []
+    )
+
+    state = json.loads(progress_file.read_text())
+    assert state["failed_prompts"] == 10
+    assert state["failure_cooldowns"] == 3
+    assert state["consecutive_failures"] == 1
+    assert len(sleeps) == 3
+    assert all(1.5 <= seconds <= 4.5 for seconds in sleeps)
