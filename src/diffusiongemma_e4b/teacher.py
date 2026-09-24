@@ -48,6 +48,7 @@ class TeacherConfig:
     prefetch_dir: Path | None = None
     student_prefix_length: int = 2048
     source_pause_state: StreamPauseState | None = None
+    offline_mode: bool = False
 
 
 class TeacherClient:
@@ -1084,6 +1085,40 @@ def _iter_disk_spooled_prompts(
         source_queue.close()
 
 
+def _iter_offline_spooled_prompts(
+    spool_root: Path,
+    fingerprint: str,
+) -> Iterable[dict[str, Any]]:
+    """Consume only prompts already present in the durable SQLite spool."""
+    safe_fingerprint = re.sub(r"[^a-zA-Z0-9_.-]", "_", fingerprint)[:64]
+    database_path = spool_root / f"prompts-{safe_fingerprint}.sqlite3"
+    if not database_path.is_file():
+        raise FileNotFoundError(
+            f"offline prompt bank not found: {database_path}; run online generation first to fill the prompt spool"
+        )
+
+    source_queue = _DiskPromptQueue(
+        spool_root, max_records=1, fingerprint=fingerprint
+    )
+    try:
+        if source_queue._active_count() == 0:
+            raise RuntimeError(
+                f"offline prompt bank is empty: {database_path}; no queued prompts remain"
+            )
+        source_queue.finish()
+        while True:
+            item = source_queue.get()
+            if item is None:
+                break
+            _, prompt_record = item
+            prompt_key = str(prompt_record.get("id") or _sha256_json(prompt_record))
+            yield prompt_record
+            source_queue.acknowledge(prompt_key)
+    finally:
+        source_queue.requeue_inflight()
+        source_queue.close()
+
+
 def _worker_generate(
     cfg: TeacherConfig,
     prompt: str,
@@ -1402,7 +1437,11 @@ def generate_records(
         raise ValueError("teacher prefetch_records must be at least 1")
     implementation = _generate_records_concurrent
     records = prompt_records
-    if cfg.concurrency == 1:
+    if cfg.offline_mode:
+        # Consume the source SQLite queue directly. This keeps each prompt in
+        # the bank until its generated output has been durably appended.
+        implementation = _generate_records_sync
+    elif cfg.concurrency == 1:
         # Preserve main-thread client execution while allowing the dataset
         # producer to keep the durable SQLite reservoir full.
         fingerprint = generation_fingerprint(cfg, data_fingerprint)
@@ -1547,6 +1586,9 @@ def main() -> None:
         default=int(os.environ.get("DG_PREFIX_LENGTH", "2048")),
     )
     args = parser.parse_args()
+    offline_mode = os.environ.get("DG_OFFLINE_MODE", "0").strip().casefold() in {
+        "1", "true", "yes", "on"
+    }
 
     base_url = args.base_url
     if base_url is None:
@@ -1555,7 +1597,7 @@ def main() -> None:
     source_config: dict[str, Any] | None = None
     mix_validation_config: dict[str, Any] | None = None
     source_pause_state: StreamPauseState | None = None
-    if args.input_jsonl is not None:
+    if args.input_jsonl is not None and not offline_mode:
         if not args.input_jsonl.is_file():
             raise FileNotFoundError(args.input_jsonl)
         data_fingerprint = _sha256_json(
@@ -1602,22 +1644,26 @@ def main() -> None:
                 "max_total_records": args.max_total_records,
             }
         )
-        prompt_records = iter_prompt_records(
-            source_config,
-            source_names=source_names,
-            max_chars=args.max_prompt_chars,
-            media_dir=args.media_dir,
-            max_records_per_source=args.max_records_per_source,
-            max_total_records=args.max_total_records,
-            streaming_retry={
-                "max_retries": args.stream_max_retries,
-                "base_s": args.stream_retry_base_s,
-                "max_s": args.stream_retry_max_s,
-                "checkpoint_rows": args.stream_checkpoint_rows,
-                "offline_poll_s": args.stream_offline_poll_s,
-                "pause_state": source_pause_state,
-            },
-            source_prefetch_records=args.stream_source_prefetch_records,
+        prompt_records = (
+            ()
+            if offline_mode
+            else iter_prompt_records(
+                source_config,
+                source_names=source_names,
+                max_chars=args.max_prompt_chars,
+                media_dir=args.media_dir,
+                max_records_per_source=args.max_records_per_source,
+                max_total_records=args.max_total_records,
+                streaming_retry={
+                    "max_retries": args.stream_max_retries,
+                    "base_s": args.stream_retry_base_s,
+                    "max_s": args.stream_retry_max_s,
+                    "checkpoint_rows": args.stream_checkpoint_rows,
+                    "offline_poll_s": args.stream_offline_poll_s,
+                    "pause_state": source_pause_state,
+                },
+                source_prefetch_records=args.stream_source_prefetch_records,
+            )
         )
         configured_min_tokens = int(source_config.get("teacher_output_filters", {}).get("min_estimated_tokens", 8))
 
@@ -1692,7 +1738,14 @@ def main() -> None:
         prefetch_dir=args.prefetch_dir,
         student_prefix_length=args.student_prefix_length,
         source_pause_state=source_pause_state,
+        offline_mode=offline_mode,
     )
+    if offline_mode:
+        spool_root = Path(cfg.prefetch_dir)
+        spool_fingerprint = generation_fingerprint(cfg, data_fingerprint)
+        prompt_records = _iter_offline_spooled_prompts(
+            spool_root, spool_fingerprint
+        )
     _repair_jsonl_tail(args.output)
     initial_state = read_progress(args.progress, output_path=args.output)
     initial_records = int(initial_state.get("records", 0))
