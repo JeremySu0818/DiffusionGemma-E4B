@@ -7,14 +7,14 @@ import json
 import math
 import mimetypes
 import os
+import queue
 import random
 import re
 import sqlite3
 import tempfile
 import threading
 import time
-from collections import deque
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -106,7 +106,7 @@ class _ThroughputMeter:
             return request_id
 
     def record_tokens(self, request_id: int, at: float, tokens: int) -> None:
-        if tokens <= 0:
+        if tokens == 0:
             return
         bucket = math.floor(at)
         with self._lock:
@@ -147,7 +147,10 @@ class _ThroughputMeter:
         first = last_complete - math.ceil(self.window_seconds) + 1
         with self._lock:
             self._prune_locked(now)
-            values = [self._bucket_tokens.get(bucket, 0.0) for bucket in range(first, last_complete + 1)]
+            # Prefix retokenization can merge tokens across sampling boundaries.
+            # Preserve signed accounting internally but never display negative TPS.
+            values = [max(0.0, self._bucket_tokens.get(bucket, 0.0))
+                      for bucket in range(first, last_complete + 1)]
         if not values or not any(values):
             return None
         first_nonzero = next(index for index, value in enumerate(values) if value > 0)
@@ -560,14 +563,37 @@ def _generate_with_retry(
             if throughput is not None and isinstance(client, OpenAICompletionsClient):
                 request_id = throughput.begin_request()
 
-                def on_delta(content: str, at: float) -> None:
-                    throughput.record_tokens(
-                        request_id,
-                        at,
-                        max(1, token_counter(content)),
-                    )
+                parts: list[str] = []
+                counted_tokens = 0
+                last_counted_at = request_started
+                last_delta_at = request_started
+                dirty = False
 
-                raw = client.generate(prompt, media=media, on_delta=on_delta)
+                def flush_tokens() -> None:
+                    nonlocal counted_tokens, dirty
+                    if not dirty:
+                        return
+                    # Count the complete prefix so token merges across SSE or
+                    # sampling boundaries are included, without byte estimates.
+                    total = token_counter("".join(parts))
+                    throughput.record_tokens(request_id, last_delta_at, total - counted_tokens)
+                    counted_tokens = total
+                    dirty = False
+
+                def on_delta(content: str, at: float) -> None:
+                    nonlocal last_counted_at, last_delta_at, dirty
+                    parts.append(content)
+                    last_delta_at = at
+                    dirty = True
+                    if at - last_counted_at >= 1.0:
+                        flush_tokens()
+                        last_counted_at = at
+
+                try:
+                    raw = client.generate(prompt, media=media, on_delta=on_delta)
+                finally:
+                    # Include the final partial interval, also on failed streams.
+                    flush_tokens()
                 throughput.finish_request(
                     request_id,
                     getattr(raw, "completion_tokens", None),
@@ -856,10 +882,6 @@ _worker_local = threading.local()
 # idle.  Keep this deliberately finite so the progress file and terminal say
 # which side of the pipeline is stalled.
 _PROMPT_PREFETCH_STALL_TIMEOUT_S = 900.0
-# Wake periodically while requests are running so newly spooled prompts can
-# occupy idle teacher slots.  Without this timeout, startup could block on the
-# first request even after the producer had filled the disk spool.
-_PROMPT_SLOT_REFILL_INTERVAL_S = 0.05
 
 
 class _DiskPromptQueue:
@@ -961,6 +983,9 @@ class _DiskPromptQueue:
             self._condition.notify_all()
 
     def get(self, timeout: float = 0.0) -> tuple[int, dict[str, Any]] | None:
+        # "inflight" is a durable lease until output acknowledgement, not an
+        # active HTTP request count. It includes executor backlog and results
+        # waiting for the consumer; concurrent generation bounds it at 2 * C.
         deadline = time.monotonic() + timeout
         with self._condition:
             row = None
@@ -1198,44 +1223,60 @@ def _generate_records_concurrent(
         )
         producer.start()
     source_exhausted = False
-    reached_target = False
     last_source_activity = time.monotonic()
-    pending: deque[_PendingGeneration] = deque()
+    # Bound running + queued + completed work. A ready executor backlog lets a
+    # worker start its next request without waiting for token accounting, fsync,
+    # progress updates, or the generator's consumer.
+    capacity = threading.BoundedSemaphore(2 * cfg.concurrency)
+    pending: dict[str, _PendingGeneration] = {}
+    pending_lock = threading.Lock()
+    completions: queue.Queue[_PendingGeneration | BaseException | None] = queue.Queue()
     executor = ThreadPoolExecutor(max_workers=cfg.concurrency, thread_name_prefix="teacher-request")
 
-    def next_source_item(wait_s: float = 0.0) -> tuple[int, dict[str, Any]] | None:
-        nonlocal last_source_activity, source_exhausted
-        value = source_queue.get(timeout=wait_s)
-        if value is None:
-            source_exhausted = source_queue.exhausted
-            return None
-        # Resume may consume many already-durable prompt IDs before reaching
-        # the first new one.  Those items prove the source is making progress
-        # and must reset the stall clock even though they are not scheduled.
-        last_source_activity = time.monotonic()
-        return value
-
-    def fill_window(wait_s: float = 0.0) -> None:
-        nonlocal source_exhausted
-        while not source_exhausted and len(pending) < cfg.concurrency:
-            if target_estimated_tokens > 0 and int(state["estimated_tokens"]) >= target_estimated_tokens:
-                return
-            # Once a request is in flight, never wait for a slow source here:
-            # doing so used to prevent completed requests from being appended.
-            source_item = next_source_item(wait_s=wait_s if not pending else 0.0)
-            if source_item is None:
-                return
-            source_index, prompt_record = source_item
-            prompt_record_id = str(prompt_record.get("id") or _sha256_json(prompt_record))
-            if prompt_record_id in scheduled_prompt_ids:
-                source_queue.acknowledge(prompt_record_id)
-                continue
-            prompt = _build_prompt(prompt_record)
-            media = dict(prompt_record.get("media") or {})
-            prompt = prompt_limiter(prompt, media)
-            scheduled_prompt_ids.add(prompt_record_id)
-            pending.append(
-                _PendingGeneration(
+    def dispatch() -> None:
+        nonlocal last_source_activity
+        try:
+            while not source_stop.is_set():
+                if not capacity.acquire(timeout=0.1):
+                    continue
+                if source_stop.is_set():
+                    capacity.release()
+                    break
+                source_item = source_queue.get(timeout=0.1)
+                if source_item is None:
+                    capacity.release()
+                    if source_queue.exhausted:
+                        break
+                    with pending_lock:
+                        idle = not pending
+                    source_is_offline = bool(
+                        cfg.source_pause_state is not None and cfg.source_pause_state.paused
+                    )
+                    if (
+                        idle
+                        and not source_is_offline
+                        and time.monotonic() - last_source_activity >= _PROMPT_PREFETCH_STALL_TIMEOUT_S
+                    ):
+                        raise RuntimeError(
+                            "prompt source prefetch stalled for "
+                            f"{_PROMPT_PREFETCH_STALL_TIMEOUT_S:g}s; no new prompt was available"
+                        )
+                    continue
+                last_source_activity = time.monotonic()
+                source_index, prompt_record = source_item
+                prompt_record_id = str(prompt_record.get("id") or _sha256_json(prompt_record))
+                if prompt_record_id in scheduled_prompt_ids:
+                    source_queue.acknowledge(prompt_record_id)
+                    capacity.release()
+                    continue
+                prompt = _build_prompt(prompt_record)
+                media = dict(prompt_record.get("media") or {})
+                prompt = prompt_limiter(prompt, media)
+                if source_stop.is_set():
+                    capacity.release()
+                    break
+                scheduled_prompt_ids.add(prompt_record_id)
+                item = _PendingGeneration(
                     source_index=source_index,
                     prompt_record=prompt_record,
                     prompt_record_id=prompt_record_id,
@@ -1243,60 +1284,48 @@ def _generate_records_concurrent(
                     media=media,
                     started=time.time(),
                     future=executor.submit(
-                        _worker_generate,
-                        cfg,
-                        prompt,
-                        media,
-                        token_counter,
-                        throughput,
+                        _worker_generate, cfg, prompt, media, token_counter, throughput,
                     ),
                 )
-            )
+                with pending_lock:
+                    pending[prompt_record_id] = item
+                item.future.add_done_callback(lambda _future, item=item: completions.put(item))
+        except BaseException as exc:
+            completions.put(exc)
+        finally:
+            completions.put(None)
 
+    def retire(item: _PendingGeneration) -> None:
+        with pending_lock:
+            del pending[item.prompt_record_id]
+        capacity.release()
+
+    dispatcher = threading.Thread(target=dispatch, name="teacher-request-dispatch", daemon=True)
+    # A resumed run that already met its target must not send more requests.
+    reached_target = (
+        target_estimated_tokens > 0
+        and int(state["estimated_tokens"]) >= target_estimated_tokens
+    )
+    if reached_target:
+        source_stop.set()
+    dispatcher.start()
     try:
-        while pending or not source_exhausted:
-            fill_window()
-            if not pending:
-                if source_exhausted:
-                    break
-                source_is_offline = bool(
-                    cfg.source_pause_state is not None and cfg.source_pause_state.paused
-                )
-                if (
-                    not source_is_offline
-                    and time.monotonic() - last_source_activity >= _PROMPT_PREFETCH_STALL_TIMEOUT_S
-                ):
-                    raise RuntimeError(
-                        "prompt source prefetch stalled for "
-                        f"{_PROMPT_PREFETCH_STALL_TIMEOUT_S:g}s; no new prompt was available"
-                    )
-                # There is no LM request to service, so use a short wait. The
-                # ordinary stall deadline remains active unless the source has
-                # explicitly reported an offline pause.
-                fill_window(wait_s=0.1)
+        while not reached_target:
+            with pending_lock:
+                drained = not pending
+            if source_exhausted and drained:
+                break
+            item = completions.get()
+            if item is None:
+                source_exhausted = True
                 continue
-
-            # Commit in completion order. Waiting only on pending[0] caused
-            # head-of-line blocking: faster responses accumulated in RAM,
-            # no slots were refilled, and four-way LM Studio concurrency
-            # eventually collapsed to one long request.
-            completed, _ = wait(
-                [candidate.future for candidate in pending],
-                timeout=_PROMPT_SLOT_REFILL_INTERVAL_S,
-                return_when=FIRST_COMPLETED,
-            )
-            if not completed:
-                fill_window()
-                continue
-            item = min(
-                (candidate for candidate in pending if candidate.future in completed),
-                key=lambda candidate: candidate.source_index,
-            )
+            if isinstance(item, BaseException):
+                raise item
             try:
                 generation = item.future.result()
                 text = generation.text
             except RuntimeError as exc:
-                pending.remove(item)
+                retire(item)
                 consecutive_failures += 1
                 state["failed_prompts"] = int(state.get("failed_prompts", 0)) + 1
                 state["consecutive_failures"] = consecutive_failures
@@ -1310,7 +1339,6 @@ def _generate_records_concurrent(
                     cfg, state, consecutive_failures
                 )
                 save_progress(progress_path, state)
-                fill_window()
                 continue
 
             consecutive_failures = 0
@@ -1318,7 +1346,7 @@ def _generate_records_concurrent(
             tok = token_counter(text)
             text_hash = hashlib.sha256(re.sub(r"\s+", " ", text).strip().encode("utf-8")).hexdigest()
             if text_hash in seen_text_hashes:
-                pending.remove(item)
+                retire(item)
                 state["filtered_records"] = int(state.get("filtered_records", 0)) + 1
                 state["source_index"] = max(
                     int(state.get("source_index", 0)), item.source_index + 1
@@ -1326,7 +1354,6 @@ def _generate_records_concurrent(
                 state["last_filter_reason"] = "duplicate_teacher_output"
                 save_progress(progress_path, state)
                 source_queue.acknowledge(item.prompt_record_id)
-                fill_window()
                 continue
 
             metadata = {str(k): v for k, v in dict(item.prompt_record.get("metadata") or {}).items()}
@@ -1380,7 +1407,7 @@ def _generate_records_concurrent(
             # source_index metadata preserve exact resume and audit identity.
             yield record
             source_queue.acknowledge(item.prompt_record_id)
-            pending.remove(item)
+            retire(item)
             seen_text_hashes.add(text_hash)
             existing_prompt_ids.add(item.prompt_record_id)
             state["records"] = int(state["records"]) + 1
@@ -1397,10 +1424,10 @@ def _generate_records_concurrent(
             if target_estimated_tokens > 0 and int(state["estimated_tokens"]) >= target_estimated_tokens:
                 reached_target = True
                 break
-            fill_window()
     finally:
         source_stop.set()
-        for item in pending:
+        dispatcher.join()
+        for item in list(pending.values()):
             item.future.cancel()
         executor.shutdown(wait=not reached_target and not pending, cancel_futures=True)
         if producer is not None:

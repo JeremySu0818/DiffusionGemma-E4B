@@ -613,3 +613,157 @@ def test_consecutive_failures_cool_down_and_continue(tmp_path, monkeypatch, conc
     assert state["consecutive_failures"] == 1
     assert len(sleeps) == 3
     assert all(1.5 <= seconds <= 4.5 for seconds in sleeps)
+
+
+@pytest.mark.parametrize("concurrency", [4, 256])
+def test_workers_refill_while_output_consumer_is_paused(tmp_path, monkeypatch, concurrency):
+    first_wave = threading.Barrier(concurrency)
+    second_wave_started = threading.Event()
+    release_second_wave = threading.Event()
+    lock = threading.Lock()
+    started = 0
+    active = 0
+    peak_active = 0
+
+    class Client:
+        def generate(self, prompt, media=None):
+            nonlocal started, active, peak_active
+            with lock:
+                started += 1
+                ordinal = started
+                active += 1
+                peak_active = max(peak_active, active)
+                if started == 2 * concurrency:
+                    second_wave_started.set()
+            try:
+                if ordinal <= concurrency:
+                    first_wave.wait(timeout=10)
+                else:
+                    assert release_second_wave.wait(timeout=10)
+                return f"unique answer for {prompt}"
+            finally:
+                with lock:
+                    active -= 1
+
+    monkeypatch.setattr(teacher, "make_client", lambda _cfg: Client())
+    records = generate_records(
+        _cfg(concurrency), _prompts(3 * concurrency), 0,
+        tmp_path / "progress.json", token_counter=lambda _text: 4,
+    )
+    try:
+        first = next(records)
+        # Simulate a consumer blocked in fsync: do not advance the generator.
+        # Every worker must still pick up a replacement, without exceeding
+        # either the API concurrency or the bounded outstanding-work budget.
+        assert second_wave_started.wait(timeout=10)
+        with lock:
+            assert started == 2 * concurrency
+            assert active == concurrency
+            assert peak_active == concurrency
+        with sqlite3.connect(next((tmp_path / "prompt_spool").glob("*.sqlite3"))) as connection:
+            leased = connection.execute(
+                "SELECT COUNT(*) FROM prompts WHERE status = 'inflight'"
+            ).fetchone()[0]
+        assert leased == 2 * concurrency  # Includes completed, unacknowledged output.
+        release_second_wave.set()
+        all_records = [first, *records]
+        assert len(all_records) == 3 * concurrency
+        assert len({r.metadata["prompt_record_id"] for r in all_records}) == len(all_records)
+    finally:
+        release_second_wave.set()
+        records.close()
+
+
+def test_stream_metrics_batch_exact_prefix_counts_and_flush_tail():
+    encoded = []
+    meter = _ThroughputMeter(ewma_alpha=1.0)
+
+    class StreamingClient(teacher.OpenAICompletionsClient):
+        def generate(self, prompt, media=None, on_delta=None):
+            started = time.monotonic()
+            for index in range(100):
+                on_delta("中文字", started + index * 0.025)
+            return teacher._TeacherResponse("valid teacher answer", completion_tokens=77)
+
+    def exact_counter(text):
+        encoded.append(text)
+        return len(text)
+
+    result = teacher._generate_with_retry(
+        StreamingClient(_cfg(256)), _cfg(256), "prompt", {},
+        token_counter=exact_counter, throughput=meter,
+    )
+    assert len(encoded) == 3  # Two one-second samples plus the final tail.
+    assert encoded[-1] == "中文字" * 100
+    assert all(encoded[-1].startswith(prefix) for prefix in encoded)
+    assert sum(meter._bucket_tokens.values()) == pytest.approx(77)
+    assert result.completion_tokens == 77
+
+
+def test_stream_metrics_preserve_token_merges_without_server_usage():
+    meter = _ThroughputMeter()
+    encoded = []
+
+    class StreamingClient(teacher.OpenAICompletionsClient):
+        def generate(self, prompt, media=None, on_delta=None):
+            started = time.monotonic()
+            on_delta("ab", started + 1.1)
+            on_delta("c", started + 1.2)
+            return "valid teacher answer"
+
+    def merging_counter(text):
+        encoded.append(text)
+        return {"ab": 2, "abc": 1}[text]
+
+    teacher._generate_with_retry(
+        StreamingClient(_cfg(256)), _cfg(256), "prompt", {},
+        token_counter=merging_counter, throughput=meter,
+    )
+    assert encoded == ["ab", "abc"]
+    assert sum(meter._bucket_tokens.values()) == 1
+
+
+def test_failed_stream_flushes_tokens_and_cleans_up_meter():
+    meter = _ThroughputMeter()
+    encoded = []
+
+    class StreamingClient(teacher.OpenAICompletionsClient):
+        def generate(self, prompt, media=None, on_delta=None):
+            on_delta("partial", time.monotonic())
+            raise ValueError("broken stream")
+
+    def exact_counter(text):
+        encoded.append(text)
+        return 3
+
+    with pytest.raises(RuntimeError, match="broken stream"):
+        teacher._generate_with_retry(
+            StreamingClient(_cfg(256)), _cfg(256), "prompt", {},
+            token_counter=exact_counter, throughput=meter,
+        )
+    assert encoded == ["partial"]
+    assert sum(meter._bucket_tokens.values()) == 3
+    assert not meter._request_tokens
+
+
+def test_dispatch_prompt_error_propagates_and_requeues(tmp_path, monkeypatch):
+    monkeypatch.setattr(teacher, "make_client", lambda _cfg: object())
+    cfg = replace(_cfg(2), prefetch_dir=tmp_path / "spool")
+
+    def broken_limiter(prompt, media):
+        raise ValueError("invalid prompt budget")
+
+    with pytest.raises(ValueError, match="invalid prompt budget"):
+        list(generate_records(cfg, _prompts(1), 0, tmp_path / "progress.json",
+                              prompt_limiter=broken_limiter))
+    with sqlite3.connect(next(cfg.prefetch_dir.glob("*.sqlite3"))) as connection:
+        assert connection.execute("SELECT status FROM prompts").fetchall() == [("queued",)]
+
+
+def test_prefix_token_correction_cannot_produce_negative_display_tps():
+    meter = _ThroughputMeter(window_seconds=1, ewma_alpha=1.0)
+    request_id = meter.begin_request()
+    meter.record_tokens(request_id, 100.5, 2)
+    meter.record_tokens(request_id, 101.5, -1)
+    assert meter.total_tps(now=102.1) is None
+    assert sum(meter._request_tokens[request_id].values()) == 1
