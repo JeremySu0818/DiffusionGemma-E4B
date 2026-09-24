@@ -1085,11 +1085,11 @@ def _iter_disk_spooled_prompts(
         source_queue.close()
 
 
-def _iter_offline_spooled_prompts(
+def _open_offline_prompt_queue(
     spool_root: Path,
     fingerprint: str,
-) -> Iterable[dict[str, Any]]:
-    """Consume only prompts already present in the durable SQLite spool."""
+) -> _DiskPromptQueue:
+    """Open the existing prompt bank without creating or refilling it."""
     safe_fingerprint = re.sub(r"[^a-zA-Z0-9_.-]", "_", fingerprint)[:64]
     database_path = spool_root / f"prompts-{safe_fingerprint}.sqlite3"
     if not database_path.is_file():
@@ -1100,23 +1100,13 @@ def _iter_offline_spooled_prompts(
     source_queue = _DiskPromptQueue(
         spool_root, max_records=1, fingerprint=fingerprint
     )
-    try:
-        if source_queue._active_count() == 0:
-            raise RuntimeError(
-                f"offline prompt bank is empty: {database_path}; no queued prompts remain"
-            )
-        source_queue.finish()
-        while True:
-            item = source_queue.get()
-            if item is None:
-                break
-            _, prompt_record = item
-            prompt_key = str(prompt_record.get("id") or _sha256_json(prompt_record))
-            yield prompt_record
-            source_queue.acknowledge(prompt_key)
-    finally:
-        source_queue.requeue_inflight()
+    if source_queue._active_count() == 0:
         source_queue.close()
+        raise RuntimeError(
+            f"offline prompt bank is empty: {database_path}; no queued prompts remain"
+        )
+    source_queue.finish()
+    return source_queue
 
 
 def _worker_generate(
@@ -1168,9 +1158,6 @@ def _generate_records_concurrent(
     # remote shard pauses between records.
     prefetch_size = max(cfg.prefetch_records, cfg.concurrency + 1)
     spool_root = cfg.prefetch_dir or progress_path.parent / "prompt_spool"
-    source_queue = _DiskPromptQueue(
-        Path(spool_root), max_records=prefetch_size, fingerprint=fingerprint
-    )
     source_stop = threading.Event()
 
     def prefetch_prompt_records() -> None:
@@ -1197,12 +1184,19 @@ def _generate_records_concurrent(
                 close()
             source_queue.finish(error)
 
-    producer = threading.Thread(
-        target=prefetch_prompt_records,
-        name="teacher-prompt-prefetch",
-        daemon=True,
-    )
-    producer.start()
+    if cfg.offline_mode:
+        source_queue = _open_offline_prompt_queue(Path(spool_root), fingerprint)
+        producer = None
+    else:
+        source_queue = _DiskPromptQueue(
+            Path(spool_root), max_records=prefetch_size, fingerprint=fingerprint
+        )
+        producer = threading.Thread(
+            target=prefetch_prompt_records,
+            name="teacher-prompt-prefetch",
+            daemon=True,
+        )
+        producer.start()
     source_exhausted = False
     reached_target = False
     last_source_activity = time.monotonic()
@@ -1409,7 +1403,8 @@ def _generate_records_concurrent(
         for item in pending:
             item.future.cancel()
         executor.shutdown(wait=not reached_target and not pending, cancel_futures=True)
-        producer.join(timeout=0.2)
+        if producer is not None:
+            producer.join(timeout=0.2)
         source_queue.requeue_inflight()
         source_queue.close()
 
@@ -1437,11 +1432,7 @@ def generate_records(
         raise ValueError("teacher prefetch_records must be at least 1")
     implementation = _generate_records_concurrent
     records = prompt_records
-    if cfg.offline_mode:
-        # Consume the source SQLite queue directly. This keeps each prompt in
-        # the bank until its generated output has been durably appended.
-        implementation = _generate_records_sync
-    elif cfg.concurrency == 1:
+    if cfg.concurrency == 1 and not cfg.offline_mode:
         # Preserve main-thread client execution while allowing the dataset
         # producer to keep the durable SQLite reservoir full.
         fingerprint = generation_fingerprint(cfg, data_fingerprint)
@@ -1740,12 +1731,6 @@ def main() -> None:
         source_pause_state=source_pause_state,
         offline_mode=offline_mode,
     )
-    if offline_mode:
-        spool_root = Path(cfg.prefetch_dir)
-        spool_fingerprint = generation_fingerprint(cfg, data_fingerprint)
-        prompt_records = _iter_offline_spooled_prompts(
-            spool_root, spool_fingerprint
-        )
     _repair_jsonl_tail(args.output)
     initial_state = read_progress(args.progress, output_path=args.output)
     initial_records = int(initial_state.get("records", 0))
