@@ -767,3 +767,101 @@ def test_prefix_token_correction_cannot_produce_negative_display_tps():
     meter.record_tokens(request_id, 101.5, -1)
     assert meter.total_tps(now=102.1) is None
     assert sum(meter._request_tokens[request_id].values()) == 1
+
+
+def test_resolve_resume_fingerprint_matches_when_endpoint_changes(tmp_path):
+    orig_cfg = _cfg(1)
+    orig_fp = generation_fingerprint(orig_cfg, "test_data")
+
+    # Simulate existing progress and output written with orig_cfg
+    progress_file = tmp_path / "progress.json"
+    output_file = tmp_path / "output.jsonl"
+    progress_file.write_text(
+        json.dumps({"records": 10, "estimated_tokens": 1000, "generation_fingerprint": orig_fp}),
+        encoding="utf-8",
+    )
+    output_file.write_text(
+        json.dumps({"id": "r1", "estimated_tokens": 100, "metadata": {"generation_fingerprint": orig_fp}}) + "\n",
+        encoding="utf-8",
+    )
+
+    # Resume with a different base_url on a LAN IP
+    new_cfg = replace(orig_cfg, base_url="http://10.0.0.229:1234/v1")
+    assert generation_fingerprint(new_cfg, "test_data") != orig_fp
+
+    # With resume_base_url or candidate match, it seamlessly resolves to the existing fingerprint
+    resolved = teacher.resolve_resume_fingerprint(
+        new_cfg,
+        data_fingerprint="test_data",
+        progress_path=progress_file,
+        output_path=output_file,
+        resume_base_url=orig_cfg.base_url,
+    )
+    assert resolved == orig_fp
+
+    # Verify original_base_url was recorded into progress.json
+    saved_state = json.loads(progress_file.read_text(encoding="utf-8"))
+    assert saved_state.get("original_base_url") == orig_cfg.base_url
+
+    # Future runs without passing resume_base_url now resolve via saved original_base_url
+    resolved_again = teacher.resolve_resume_fingerprint(
+        new_cfg,
+        data_fingerprint="test_data",
+        progress_path=progress_file,
+        output_path=output_file,
+    )
+    assert resolved_again == orig_fp
+
+
+def test_resolve_resume_fingerprint_rejects_incompatible_model_change(tmp_path):
+    orig_cfg = _cfg(1)
+    orig_fp = generation_fingerprint(orig_cfg, "test_data")
+
+    progress_file = tmp_path / "progress.json"
+    output_file = tmp_path / "output.jsonl"
+    progress_file.write_text(
+        json.dumps({"records": 10, "estimated_tokens": 1000, "generation_fingerprint": orig_fp}),
+        encoding="utf-8",
+    )
+    output_file.write_text(
+        json.dumps({"id": "r1", "estimated_tokens": 100, "metadata": {"generation_fingerprint": orig_fp}}) + "\n",
+        encoding="utf-8",
+    )
+
+    # Incompatible change: different model
+    incompatible_cfg = replace(orig_cfg, model="completely-different-model")
+    resolved = teacher.resolve_resume_fingerprint(
+        incompatible_cfg,
+        data_fingerprint="test_data",
+        progress_path=progress_file,
+        output_path=output_file,
+    )
+    # Does not resolve to orig_fp; keeps the new fingerprint which causes read_progress to fail safely
+    assert resolved != orig_fp
+    with pytest.raises(RuntimeError, match="fingerprint mismatch"):
+        teacher.read_progress(progress_file, output_path=output_file, expected_fingerprint=resolved)
+
+
+def test_resolve_resume_fingerprint_explicit_allow(tmp_path):
+    orig_cfg = _cfg(1)
+    orig_fp = "custom_legacy_fp_123"
+
+    progress_file = tmp_path / "progress.json"
+    output_file = tmp_path / "output.jsonl"
+    progress_file.write_text(
+        json.dumps({"records": 5, "estimated_tokens": 500, "generation_fingerprint": orig_fp}),
+        encoding="utf-8",
+    )
+    output_file.write_text(
+        json.dumps({"id": "r1", "estimated_tokens": 100, "metadata": {"generation_fingerprint": orig_fp}}) + "\n",
+        encoding="utf-8",
+    )
+
+    resolved = teacher.resolve_resume_fingerprint(
+        orig_cfg,
+        data_fingerprint="test_data",
+        progress_path=progress_file,
+        output_path=output_file,
+        allow_fingerprint=orig_fp,
+    )
+    assert resolved == orig_fp

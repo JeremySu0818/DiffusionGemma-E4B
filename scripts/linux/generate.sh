@@ -62,4 +62,6 @@ python -m diffusiongemma_e4b.teacher \
   --concurrency "${DG_TEACHER_CONCURRENCY:-10}" \
   --prefetch-records "${DG_TEACHER_PREFETCH_RECORDS:-16384}" \
   --prefetch-dir "${DG_TEACHER_PREFETCH_DIR:-data/teacher_supervised/prompt_spool}" \
-  --student-prefix-length "${DG_PREFIX_LENGTH:-2048}"
+  --student-prefix-length "${DG_PREFIX_LENGTH:-2048}" \
+  --resume-base-url "${DG_TEACHER_RESUME_BASE_URL:-${DG_TEACHER_ORIGINAL_BASE_URL:-}}" \
+  --allow-resume-fingerprint "${DG_ALLOW_RESUME_FINGERPRINT:-}"

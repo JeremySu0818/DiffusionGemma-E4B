@@ -15,9 +15,10 @@ import tempfile
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from tqdm.auto import tqdm
@@ -49,6 +50,8 @@ class TeacherConfig:
     student_prefix_length: int = 2048
     source_pause_state: StreamPauseState | None = None
     offline_mode: bool = False
+    resume_base_url: str | None = None
+    allow_resume_fingerprint: str | None = None
 
 
 class TeacherClient:
@@ -393,6 +396,106 @@ def generation_fingerprint(cfg: TeacherConfig, data_fingerprint: str = "") -> st
     )
 
 
+def resolve_resume_fingerprint(
+    cfg: TeacherConfig,
+    data_fingerprint: str = "",
+    progress_path: Path | None = None,
+    output_path: Path | None = None,
+    resume_base_url: str | None = None,
+    allow_fingerprint: str | None = None,
+) -> str:
+    """Resolve the effective generation fingerprint, accommodating compatible resumes.
+
+    If an existing dataset output or progress file was generated with compatible
+    model, tokenizer, prompt, and sampling settings but a different network endpoint
+    (such as localhost vs a LAN/cloud server IP), reuse the existing fingerprint so
+    durable outputs and prompt spools continue seamlessly.
+    """
+    current_fp = generation_fingerprint(cfg, data_fingerprint)
+    output_state = (
+        progress_from_output(output_path)
+        if output_path is not None and output_path.exists()
+        else {"records": 0, "estimated_tokens": 0}
+    )
+    progress_state: dict[str, Any] = {}
+    if progress_path is not None and progress_path.exists():
+        try:
+            progress_state = json.loads(progress_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    if int(output_state.get("records", 0)) == 0 and int(progress_state.get("records", 0)) == 0:
+        return current_fp
+
+    found = str(output_state.get("generation_fingerprint") or progress_state.get("generation_fingerprint") or "").strip()
+    if not found or found == current_fp:
+        return current_fp
+
+    env_allowed = (
+        allow_fingerprint
+        or getattr(cfg, "allow_resume_fingerprint", None)
+        or os.environ.get("DG_ALLOW_RESUME_FINGERPRINT", "")
+    )
+    if env_allowed and str(env_allowed).strip() in {found, "1", "true", "yes", "all"}:
+        return found
+
+    candidates: list[str] = []
+    raw_candidates = [
+        progress_state.get("original_base_url"),
+        progress_state.get("base_url"),
+        resume_base_url,
+        getattr(cfg, "resume_base_url", None),
+        os.environ.get("DG_TEACHER_RESUME_BASE_URL"),
+        os.environ.get("DG_TEACHER_ORIGINAL_BASE_URL"),
+        "http://localhost:1234/v1",
+        "http://127.0.0.1:1234/v1",
+        "http://localhost:8000/v1",
+        "http://127.0.0.1:8000/v1",
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:11434/v1",
+        DEFAULT_LMSTUDIO_BASE_URL,
+        DEFAULT_OLLAMA_BASE_URL,
+    ]
+    for c in raw_candidates:
+        if c and isinstance(c, str):
+            c_clean = c.strip()
+            if c_clean and c_clean not in candidates:
+                candidates.append(c_clean)
+
+    if cfg.base_url:
+        try:
+            parsed = urlparse(cfg.base_url)
+            port = parsed.port
+            path = parsed.path or "/v1"
+            scheme = parsed.scheme or "http"
+            for host in ["localhost", "127.0.0.1", "0.0.0.0"]:
+                netloc = f"{host}:{port}" if port else host
+                variant = urlunparse((scheme, netloc, path, "", "", "")).rstrip("/")
+                if variant not in candidates:
+                    candidates.append(variant)
+        except Exception:
+            pass
+
+    for candidate_url in candidates:
+        test_cfg = replace(cfg, base_url=candidate_url)
+        if generation_fingerprint(test_cfg, data_fingerprint) == found:
+            if progress_path is not None and progress_path.exists():
+                try:
+                    if progress_state.get("original_base_url") != candidate_url:
+                        progress_state["original_base_url"] = candidate_url
+                        save_progress(progress_path, progress_state)
+                except Exception:
+                    pass
+            print(
+                f"Resuming generation for compatible dataset: using existing generation fingerprint {found} "
+                f"(original endpoint: {candidate_url}, current: {cfg.base_url})",
+                flush=True,
+            )
+            return found
+
+    return current_fp
+
+
 def _repair_jsonl_tail(path: Path) -> None:
     """Keep complete final JSON and truncate only a crash-partial final line."""
     if not path.exists() or path.stat().st_size == 0:
@@ -473,7 +576,8 @@ def read_progress(
         found = output_state.get("generation_fingerprint") or state.get("generation_fingerprint")
         if found != expected_fingerprint:
             raise RuntimeError(
-                "teacher resume fingerprint mismatch; use a new output directory or restore the original data/model/config"
+                f"teacher resume fingerprint mismatch: found {found}, expected {expected_fingerprint}; "
+                "use a new output directory or restore the original data/model/config"
             )
     if (
         output_state["records"] != int(state.get("records", 0))
@@ -752,7 +856,14 @@ def _generate_records_sync(
     throughput: _ThroughputMeter | None = None,
 ) -> Iterable[TeacherSupervisedRecord]:
     client = make_client(cfg)
-    fingerprint = generation_fingerprint(cfg, data_fingerprint)
+    fingerprint = resolve_resume_fingerprint(
+        cfg,
+        data_fingerprint=data_fingerprint,
+        progress_path=progress_path,
+        output_path=output_path,
+        resume_base_url=cfg.resume_base_url,
+        allow_fingerprint=cfg.allow_resume_fingerprint,
+    )
     state = read_progress(progress_path, output_path=output_path, expected_fingerprint=fingerprint)
     state.setdefault("records", 0)
     state.setdefault("estimated_tokens", 0)
@@ -1164,7 +1275,14 @@ def _generate_records_concurrent(
     prompt_limiter: Callable[[str, dict[str, Any]], str] = _identity_prompt_limiter,
     throughput: _ThroughputMeter | None = None,
 ) -> Iterable[TeacherSupervisedRecord]:
-    fingerprint = generation_fingerprint(cfg, data_fingerprint)
+    fingerprint = resolve_resume_fingerprint(
+        cfg,
+        data_fingerprint=data_fingerprint,
+        progress_path=progress_path,
+        output_path=output_path,
+        resume_base_url=cfg.resume_base_url,
+        allow_fingerprint=cfg.allow_resume_fingerprint,
+    )
     state = read_progress(progress_path, output_path=output_path, expected_fingerprint=fingerprint)
     state.setdefault("records", 0)
     state.setdefault("estimated_tokens", 0)
@@ -1462,7 +1580,14 @@ def generate_records(
     if cfg.concurrency == 1 and not cfg.offline_mode:
         # Preserve main-thread client execution while allowing the dataset
         # producer to keep the durable SQLite reservoir full.
-        fingerprint = generation_fingerprint(cfg, data_fingerprint)
+        fingerprint = resolve_resume_fingerprint(
+            cfg,
+            data_fingerprint=data_fingerprint,
+            progress_path=progress_path,
+            output_path=output_path,
+            resume_base_url=cfg.resume_base_url,
+            allow_fingerprint=cfg.allow_resume_fingerprint,
+        )
         records = _iter_disk_spooled_prompts(cfg, prompt_records, progress_path, fingerprint)
         implementation = _generate_records_sync
     yield from implementation(
@@ -1602,6 +1727,19 @@ def main() -> None:
         "--student-prefix-length",
         type=int,
         default=int(os.environ.get("DG_PREFIX_LENGTH", "2048")),
+    )
+    parser.add_argument(
+        "--resume-base-url",
+        default=os.environ.get(
+            "DG_TEACHER_RESUME_BASE_URL",
+            os.environ.get("DG_TEACHER_ORIGINAL_BASE_URL", None),
+        ),
+        help="Original teacher base URL used when the dataset was initialized, if different from --base-url.",
+    )
+    parser.add_argument(
+        "--allow-resume-fingerprint",
+        default=os.environ.get("DG_ALLOW_RESUME_FINGERPRINT", None),
+        help="Explicitly accept an existing dataset fingerprint when resuming.",
     )
     args = parser.parse_args()
     offline_mode = os.environ.get("DG_OFFLINE_MODE", "0").strip().casefold() in {
@@ -1757,6 +1895,8 @@ def main() -> None:
         student_prefix_length=args.student_prefix_length,
         source_pause_state=source_pause_state,
         offline_mode=offline_mode,
+        resume_base_url=args.resume_base_url,
+        allow_resume_fingerprint=args.allow_resume_fingerprint,
     )
     _repair_jsonl_tail(args.output)
     initial_state = read_progress(args.progress, output_path=args.output)
@@ -1853,10 +1993,18 @@ def main() -> None:
         progress_stop.set()
         progress_thread.join(timeout=2)
         pbar.close()
+    final_fingerprint = resolve_resume_fingerprint(
+        cfg,
+        data_fingerprint=data_fingerprint,
+        progress_path=args.progress,
+        output_path=args.output,
+        resume_base_url=args.resume_base_url,
+        allow_fingerprint=args.allow_resume_fingerprint,
+    )
     final_state = read_progress(
         args.progress,
         output_path=args.output,
-        expected_fingerprint=generation_fingerprint(cfg, data_fingerprint),
+        expected_fingerprint=final_fingerprint,
     )
     if mix_validation_config is not None:
         final_state["mix_validation"] = validate_generated_mix(
