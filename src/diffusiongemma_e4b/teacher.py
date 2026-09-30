@@ -396,6 +396,11 @@ def generation_fingerprint(cfg: TeacherConfig, data_fingerprint: str = "") -> st
     )
 
 
+def _is_gemma_4_e4b_model_name(model_name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(model_name).casefold())
+    return "gemma4e4b" in normalized
+
+
 def resolve_resume_fingerprint(
     cfg: TeacherConfig,
     data_fingerprint: str = "",
@@ -409,7 +414,11 @@ def resolve_resume_fingerprint(
     If an existing dataset output or progress file was generated with compatible
     model, tokenizer, prompt, and sampling settings but a different network endpoint
     (such as localhost vs a LAN/cloud server IP), reuse the existing fingerprint so
-    durable outputs and prompt spools continue seamlessly.
+    durable outputs and prompt spools continue seamlessly. Gemma 4 E4B served-model
+    aliases are also compatible because OpenAI-compatible endpoints may require a
+    request model name that differs from the name used to create the dataset. When
+    both the saved and current names identify Gemma 4 E4B, keep the saved identity
+    even if the old fingerprint cannot be reconstructed from current settings.
     """
     current_fp = generation_fingerprint(cfg, data_fingerprint)
     output_state = (
@@ -462,6 +471,14 @@ def resolve_resume_fingerprint(
             if c_clean and c_clean not in candidates:
                 candidates.append(c_clean)
 
+    # Also try the current endpoint when matching a previous model alias. The
+    # current fingerprint already covered this URL with cfg.model, but a prior
+    # fingerprint may have been generated with a different Gemma served name.
+    if cfg.base_url:
+        current_url = cfg.base_url.strip()
+        if current_url and current_url not in candidates:
+            candidates.insert(0, current_url)
+
     if cfg.base_url:
         try:
             parsed = urlparse(cfg.base_url)
@@ -476,22 +493,63 @@ def resolve_resume_fingerprint(
         except Exception:
             pass
 
+    original_models: list[str] = []
+    for value in (
+        progress_state.get("original_model"),
+        output_state.get("source_model"),
+        cfg.model,
+    ):
+        if isinstance(value, str):
+            model_name = value.strip()
+            if model_name and model_name not in original_models:
+                original_models.append(model_name)
+
     for candidate_url in candidates:
         test_cfg = replace(cfg, base_url=candidate_url)
+        matched_model: str | None = None
         if generation_fingerprint(test_cfg, data_fingerprint) == found:
+            matched_model = cfg.model
+        elif _is_gemma_4_e4b_model_name(cfg.model):
+            for original_model in original_models:
+                if not _is_gemma_4_e4b_model_name(original_model):
+                    continue
+                model_cfg = replace(test_cfg, model=original_model)
+                if generation_fingerprint(model_cfg, data_fingerprint) == found:
+                    matched_model = original_model
+                    break
+
+        if matched_model is not None:
             if progress_path is not None and progress_path.exists():
                 try:
+                    progress_changed = False
                     if progress_state.get("original_base_url") != candidate_url:
                         progress_state["original_base_url"] = candidate_url
+                        progress_changed = True
+                    if progress_state.get("original_model") != matched_model:
+                        progress_state["original_model"] = matched_model
+                        progress_changed = True
+                    if progress_changed:
                         save_progress(progress_path, progress_state)
                 except Exception:
                     pass
             print(
                 f"Resuming generation for compatible dataset: using existing generation fingerprint {found} "
-                f"(original endpoint: {candidate_url}, current: {cfg.base_url})",
+                f"(original endpoint: {candidate_url}, current: {cfg.base_url}, "
+                f"original model: {matched_model}, current model: {cfg.model})",
                 flush=True,
             )
             return found
+
+    saved_model = (
+        output_state.get("source_model")
+        or progress_state.get("original_model")
+        or progress_state.get("source_model")
+    )
+    if _is_gemma_4_e4b_model_name(cfg.model) and _is_gemma_4_e4b_model_name(saved_model):
+        if progress_path is not None and progress_path.exists() and progress_state.get("original_model") != saved_model:
+            progress_state["original_model"] = saved_model
+            save_progress(progress_path, progress_state)
+        return found
 
     return current_fp
 
@@ -530,11 +588,15 @@ def progress_from_output(output_path: Path) -> dict[str, Any]:
     source_index = 0
     last_record_id = None
     fingerprints: set[str] = set()
+    source_models: set[str] = set()
     records_by_bucket: dict[str, int] = {}
     tokens_by_bucket: dict[str, int] = {}
     for row in iter_jsonl(output_path):
         records += 1
         estimated_tokens += int(row.get("estimated_tokens") or 0)
+        source_model = str(row.get("source_model") or "").strip()
+        if source_model:
+            source_models.add(source_model)
         metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         source_index = max(source_index, int(metadata.get("source_index") or records))
         fingerprint = str(metadata.get("generation_fingerprint") or "")
@@ -555,6 +617,8 @@ def progress_from_output(output_path: Path) -> dict[str, Any]:
     }
     if last_record_id is not None:
         state["last_record_id"] = last_record_id
+    if len(source_models) == 1:
+        state["source_model"] = next(iter(source_models))
     if len(fingerprints) == 1:
         state["generation_fingerprint"] = next(iter(fingerprints))
     elif len(fingerprints) > 1:
