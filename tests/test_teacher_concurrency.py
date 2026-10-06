@@ -21,6 +21,26 @@ from diffusiongemma_e4b.teacher import (
 )
 
 
+@pytest.mark.parametrize("text", [
+    '<html><body><h1>Hello world</h1></body></html>',
+    '```html\n<html lang="en"><body>Hello</body></html>\n```',
+    'A 502 Bad Gateway means the proxy received an invalid upstream response.',
+    'Handle service unavailable errors with exponential backoff.',
+    'The server may report internal server error or rate limit exceeded.',
+])
+def test_teacher_accepts_html_and_explanations_of_http_errors(text):
+    assert teacher._validated_teacher_text(text, "Explain or implement this", 8) == text
+
+
+@pytest.mark.parametrize("text", [
+    'Internal Server Error', '502 Bad Gateway', 'HTTP 503 Service Unavailable',
+    'Error: 429 Rate limit exceeded.', 'upstream error',
+])
+def test_teacher_rejects_bare_endpoint_errors(text):
+    with pytest.raises(ValueError, match="endpoint failure text"):
+        teacher._validated_teacher_text(text, "Explain or implement this", 8)
+
+
 def test_throughput_eta_uses_remaining_target_tokens_over_total_tps():
     assert _throughput_eta(550, 50, 100.0) == "00:05"
     assert _throughput_eta(550, 550, 100.0) == "00:00"

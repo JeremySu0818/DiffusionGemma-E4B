@@ -690,7 +690,10 @@ def _build_prompt(record: dict[str, Any]) -> str:
 
 
 _ENDPOINT_FAILURE_RE = re.compile(
-    r"(?:internal server error|bad gateway|service unavailable|upstream error|rate limit exceeded|<html)", re.IGNORECASE
+    r"\s*(?:(?:error\s*:?\s*)?(?:HTTP\s+)?(?:429|500|502|503|504)\s*[:\-]?\s*)?"
+    r"(?:internal server error|bad gateway|service unavailable|upstream error|rate limit exceeded)"
+    r"\s*[.!]?\s*",
+    re.IGNORECASE,
 )
 
 
@@ -707,7 +710,9 @@ def _validated_teacher_text(
     prompt_normalized = re.sub(r"\s+", " ", prompt).strip().casefold()
     if normalized == prompt_normalized:
         raise ValueError("teacher echoed the prompt without an answer")
-    if _ENDPOINT_FAILURE_RE.search(text):
+    # HTTP failures are checked by the client. Only reject a bare error message
+    # here: answers may legitimately explain HTTP errors or contain HTML code.
+    if _ENDPOINT_FAILURE_RE.fullmatch(text):
         raise ValueError("teacher output contains endpoint failure text")
     words = normalized.split()
     if len(words) >= 32 and len(set(words)) / len(words) < 0.08:
