@@ -5,6 +5,69 @@ from pathlib import Path
 from diffusiongemma_e4b.data_sources import _prompt_record
 
 
+def test_streaming_parquet_does_not_retain_entire_decoded_row_group(tmp_path):
+    import gc
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from diffusiongemma_e4b.data_sources import _open_hf_dataset
+
+    path = tmp_path / "rows.parquet"
+    table = pa.table({"prompt": [str(i) + "x" * 16384 for i in range(1024)]})
+    pq.write_table(
+        table, path, row_group_size=1024, data_page_size=65536,
+        write_batch_size=32, use_dictionary=False,
+    )
+    del table
+    gc.collect()
+    baseline = pa.total_allocated_bytes()
+    dataset = _open_hf_dataset({"id": str(tmp_path)})
+    rows = iter(dataset)
+    first = next(rows)
+    checkpoint = dataset.state_dict()
+    try:
+        # A two-row queue cannot fix a scanner holding a 16 MiB row group.
+        assert pa.total_allocated_bytes() - baseline < 4 * 1024 * 1024
+        assert first["prompt"].startswith("0x")
+        assert sum(1 for _ in rows) == 1023
+    finally:
+        rows.close()
+    resumed = _open_hf_dataset({"id": str(tmp_path)})
+    resumed.load_state_dict(checkpoint)
+    resumed_rows = iter(resumed)
+    try:
+        assert next(resumed_rows)["prompt"].startswith("1x")
+    finally:
+        resumed_rows.close()
+
+
+def test_prefetch_prepares_prompt_without_retaining_raw_payload(tmp_path):
+    import weakref
+    from diffusiongemma_e4b.data_sources import _prepare_source_rows
+
+    refs = []
+
+    class RawRow(dict):
+        pass
+
+    class Rows:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            row = RawRow(prompt="p" * 1000, unused_payload=bytearray(1024 * 1024))
+            refs.append(weakref.ref(row))
+            return row
+
+    prepared = _prepare_source_rows(Rows(), {"id": "unit/text"}, 100, tmp_path)
+    try:
+        item = next(prepared)
+        assert len(item.record["prompt_text"]) == 100
+        assert "unused_payload" not in item.record
+        assert refs[0]() is None
+    finally:
+        prepared.close()
+
+
 def test_image_only_placeholder_gets_meaningful_teacher_prompt(tmp_path: Path) -> None:
     source = {
         "id": "unit/images",

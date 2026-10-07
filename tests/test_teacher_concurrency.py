@@ -21,6 +21,36 @@ from diffusiongemma_e4b.teacher import (
 )
 
 
+@pytest.mark.parametrize("mode", ["success", "malformed", "http_error"])
+def test_http_stream_is_closed_on_completion_and_failure(mode):
+    class Response:
+        closed = False
+
+        def raise_for_status(self):
+            if mode == "http_error":
+                raise RuntimeError("HTTP failure")
+
+        def iter_lines(self, **_kwargs):
+            if mode == "malformed":
+                yield "data: {broken"
+            else:
+                yield 'data: {"choices":[{"delta":{"content":"hello"}}]}'
+                yield "data: [DONE]"
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    client = teacher.OpenAICompletionsClient(_cfg(1))
+    client.session.post = lambda *args, **kwargs: response
+    if mode == "success":
+        assert client.generate("prompt") == "hello"
+    else:
+        with pytest.raises((ValueError, RuntimeError)):
+            client.generate("prompt")
+    assert response.closed
+
+
 @pytest.mark.parametrize("text", [
     '<html><body><h1>Hello world</h1></body></html>',
     '```html\n<html lang="en"><body>Hello</body></html>\n```',

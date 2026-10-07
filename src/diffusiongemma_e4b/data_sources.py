@@ -19,6 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import MethodType
 from typing import Any, Iterable, Iterator
 from urllib.parse import urlparse
 
@@ -402,9 +403,48 @@ def _prompt_record(source: dict[str, Any], row: dict[str, Any], max_chars: int, 
     }
 
 
+def _stream_parquet_tables(builder: Any, files: Any, row_groups_list: Any = None) -> Iterator[Any]:
+    """Use the batch reader; the dataset scanner retains decoded row groups."""
+    import pyarrow as arrow
+    import pyarrow.dataset as arrow_dataset
+    import pyarrow.parquet as parquet
+    from datasets.builder import Key
+    from datasets.packaged_modules.parquet import parquet as parquet_module
+
+    filter_expr = builder.config.filters
+    if filter_expr is not None and not isinstance(filter_expr, arrow_dataset.Expression):
+        filter_expr = parquet.filters_to_expression(filter_expr)
+    if row_groups_list is None:
+        row_groups_list = [None] * len(files)
+    for file_index, (file, row_groups) in enumerate(zip(files, row_groups_list)):
+        try:
+            # datasets patches this module's open with its authenticated remote
+            # streaming opener. Keep those credentials and retry semantics.
+            with parquet_module.open(file, "rb") as stream:
+                reader = parquet.ParquetFile(
+                    stream, pre_buffer=False, buffer_size=64 * 1024,
+                )
+                try:
+                    for batch_index, batch in enumerate(reader.iter_batches(
+                        batch_size=32, row_groups=row_groups,
+                        columns=builder.config.columns,
+                    )):
+                        table = arrow.Table.from_batches([batch])
+                        if filter_expr is not None:
+                            table = arrow_dataset.dataset(table).to_table(filter=filter_expr)
+                        yield Key(file_index, batch_index), builder._cast_table(table)
+                finally:
+                    reader.close()
+        except (arrow.ArrowInvalid, ValueError) as exc:
+            if builder.config.on_bad_files == "error":
+                raise
+            if builder.config.on_bad_files == "warn":
+                print(f"WARNING: skipping bad Parquet file {file}: {exc}", file=sys.stderr)
+
+
 def _open_hf_dataset(source: dict[str, Any]) -> Any:
     try:
-        from datasets import load_dataset
+        from datasets import load_dataset, load_dataset_builder
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError("Install the `datasets` package to prepare prompt/context banks.") from exc
     kwargs = {
@@ -413,7 +453,24 @@ def _open_hf_dataset(source: dict[str, Any]) -> Any:
         "trust_remote_code": bool(source.get("trust_remote_code", False)),
     }
     config = source.get("config")
-    return load_dataset(source["id"], config, **kwargs) if config else load_dataset(source["id"], **kwargs)
+    if not kwargs["streaming"]:
+        return load_dataset(source["id"], config, **kwargs) if config else load_dataset(source["id"], **kwargs)
+
+    # Streaming does not imply small allocations. Recent datasets versions
+    # default Parquet batches to an entire row group, and Arrow prebuffers its
+    # columns. Multiple paused source iterators retain those buffers together.
+    builder = load_dataset_builder(source["id"], config)
+    from datasets.packaged_modules.parquet.parquet import ParquetConfig
+
+    if isinstance(builder.config, ParquetConfig):
+        import pyarrow.dataset as arrow_dataset
+
+        builder.config.batch_size = min(builder.config.batch_size or 32, 32)
+        builder.config.fragment_scan_options = arrow_dataset.ParquetFragmentScanOptions(
+            pre_buffer=False, use_buffered_stream=True, buffer_size=64 * 1024,
+        )
+        builder._generate_tables = MethodType(_stream_parquet_tables, builder)
+    return builder.as_streaming_dataset(split=kwargs["split"])
 
 
 _STREAM_RETRY_CONFIG_LOCK = threading.Lock()
@@ -579,6 +636,15 @@ class _ResilientDatasetIterator:
 
     def __iter__(self) -> _ResilientDatasetIterator:
         return self
+
+    def close(self) -> None:
+        iterator = self.iterator
+        self.iterator = None
+        self.dataset = None
+        self.resume_state = None
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
 
     def _reopen(self) -> None:
         dataset = _open_hf_dataset(self.source)
@@ -798,6 +864,34 @@ class _PrefetchFailure:
     error: BaseException
 
 
+@dataclass
+class _PreparedPrompt:
+    record: dict[str, Any] | None
+    error: str | None = None
+
+
+def _prepare_source_rows(
+    rows: Iterator[dict[str, Any]], source: dict[str, Any],
+    max_chars: int, media_dir: Path | None,
+) -> Iterator[_PreparedPrompt]:
+    """Buffer compact prompts and media paths, never raw decoded dataset rows."""
+    try:
+        for row in rows:
+            try:
+                prepared = _PreparedPrompt(
+                    _prompt_record(source, row, max_chars=max_chars, media_dir=media_dir)
+                )
+            except Exception as exc:
+                # Do not retain a traceback referencing a large raw row.
+                prepared = _PreparedPrompt(None, repr(exc))
+            del row
+            yield prepared
+    finally:
+        close = getattr(rows, "close", None)
+        if callable(close):
+            close()
+
+
 _PREFETCH_END = object()
 
 
@@ -844,6 +938,7 @@ class _BackgroundPrefetchIterator:
             close = getattr(self._rows, "close", None)
             if callable(close):
                 close()
+            self._rows = iter(())
 
     def next(self, timeout: float | None = None) -> dict[str, Any]:
         if self._done:
@@ -862,6 +957,11 @@ class _BackgroundPrefetchIterator:
 
     def close(self) -> None:
         self._stop.set()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
 
 
 def iter_prompt_records(
@@ -914,7 +1014,7 @@ def iter_prompt_records(
                     else source_prefetch_records
                 )
                 row_iterator = _BackgroundPrefetchIterator(
-                    row_iterator,
+                    _prepare_source_rows(row_iterator, source, max_chars, media_dir),
                     max_records=max(1, per_source_records),
                     name=str(source.get("name") or source["id"]),
                 )
@@ -995,7 +1095,14 @@ def iter_prompt_records(
                     f"{state.rows_read} rows; refusing to silently remove it from bucket {bucket}: {exc}"
                 ) from exc
             try:
-                record = _prompt_record(state.source, row, max_chars=max_chars, media_dir=media_dir)
+                if isinstance(row, _PreparedPrompt):
+                    if row.error is not None:
+                        failures.append({"source": str(state.source.get("id")), "phase": "convert", "error": row.error})
+                        state.rejected += 1
+                        continue
+                    record = row.record
+                else:
+                    record = _prompt_record(state.source, row, max_chars=max_chars, media_dir=media_dir)
             except Exception as exc:  # noqa: BLE001
                 failures.append({"source": str(state.source.get("id")), "phase": "convert", "error": repr(exc)})
                 state.rejected += 1

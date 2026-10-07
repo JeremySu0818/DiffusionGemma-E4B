@@ -576,6 +576,9 @@ def test_required_bucket_underfill_is_fatal(tmp_path: Path):
 
 
 class _FakeResponse:
+    def close(self):
+        return None
+
     def raise_for_status(self):
         return None
 

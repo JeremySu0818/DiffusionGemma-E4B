@@ -224,36 +224,39 @@ class OpenAICompletionsClient(TeacherClient):
             timeout=self.cfg.timeout_s,
             stream=True,
         )
-        response.raise_for_status()
-        parts: list[str] = []
-        completion_tokens: int | None = None
-        for raw_line in response.iter_lines(decode_unicode=True):
-            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-            line = str(line or "").strip()
-            if not line.startswith("data:"):
-                continue
-            payload_text = line[5:].strip()
-            if payload_text == "[DONE]":
-                break
-            event = json.loads(payload_text)
-            usage = event.get("usage") if isinstance(event, dict) else None
-            reported = usage.get("completion_tokens") if isinstance(usage, dict) else None
-            if isinstance(reported, int) and reported >= 0:
-                completion_tokens = reported
-            choices = event.get("choices") if isinstance(event, dict) else None
-            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-                continue
-            delta = choices[0].get("delta")
-            content = delta.get("content") if isinstance(delta, dict) else None
-            reasoning = (
-                delta.get("reasoning_content") if isinstance(delta, dict) else None
-            )
-            if isinstance(reasoning, str) and reasoning and on_delta is not None:
-                on_delta(reasoning, time.monotonic())
-            if isinstance(content, str) and content:
-                parts.append(content)
-                if on_delta is not None:
-                    on_delta(content, time.monotonic())
+        try:
+            response.raise_for_status()
+            parts: list[str] = []
+            completion_tokens: int | None = None
+            for raw_line in response.iter_lines(decode_unicode=True):
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                line = str(line or "").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload_text = line[5:].strip()
+                if payload_text == "[DONE]":
+                    break
+                event = json.loads(payload_text)
+                usage = event.get("usage") if isinstance(event, dict) else None
+                reported = usage.get("completion_tokens") if isinstance(usage, dict) else None
+                if isinstance(reported, int) and reported >= 0:
+                    completion_tokens = reported
+                choices = event.get("choices") if isinstance(event, dict) else None
+                if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                    continue
+                delta = choices[0].get("delta")
+                content = delta.get("content") if isinstance(delta, dict) else None
+                reasoning = (
+                    delta.get("reasoning_content") if isinstance(delta, dict) else None
+                )
+                if isinstance(reasoning, str) and reasoning and on_delta is not None:
+                    on_delta(reasoning, time.monotonic())
+                if isinstance(content, str) and content:
+                    parts.append(content)
+                    if on_delta is not None:
+                        on_delta(content, time.monotonic())
+        finally:
+            response.close()
         request_seconds = time.monotonic() - started
         if not isinstance(completion_tokens, int) or completion_tokens < 0:
             completion_tokens = None
