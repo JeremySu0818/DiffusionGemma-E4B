@@ -567,10 +567,23 @@ def _repair_jsonl_tail(path: Path) -> None:
         f.seek(size - 1)
         if f.read(1) == b"\n":
             return
-        f.seek(0)
-        data = f.read()
-        last_newline = data.rfind(b"\n")
-        fragment = data[last_newline + 1 :]
+        # Scan backwards in bounded blocks instead of loading a potentially
+        # multi-GB dataset just to repair its final record.
+        position = size
+        fragments: list[bytes] = []
+        last_newline = -1
+        while position > 0:
+            start = max(0, position - 65536)
+            f.seek(start)
+            block = f.read(position - start)
+            newline = block.rfind(b"\n")
+            if newline >= 0:
+                last_newline = start + newline
+                fragments.append(block[newline + 1 :])
+                break
+            fragments.append(block)
+            position = start
+        fragment = b"".join(reversed(fragments))
         try:
             json.loads(fragment.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -582,51 +595,138 @@ def _repair_jsonl_tail(path: Path) -> None:
         os.fsync(f.fileno())
 
 
-def progress_from_output(output_path: Path) -> dict[str, Any]:
-    if not output_path.exists():
-        return {"records": 0, "estimated_tokens": 0, "source_index": 0}
-    _repair_jsonl_tail(output_path)
-    records = 0
-    estimated_tokens = 0
-    source_index = 0
-    last_record_id = None
-    fingerprints: set[str] = set()
-    source_models: set[str] = set()
-    records_by_bucket: dict[str, int] = {}
-    tokens_by_bucket: dict[str, int] = {}
-    for row in iter_jsonl(output_path):
-        records += 1
-        estimated_tokens += int(row.get("estimated_tokens") or 0)
-        source_model = str(row.get("source_model") or "").strip()
-        if source_model:
-            source_models.add(source_model)
-        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        source_index = max(source_index, int(metadata.get("source_index") or records))
-        fingerprint = str(metadata.get("generation_fingerprint") or "")
-        bucket = str(metadata.get("bucket") or "unknown")
-        records_by_bucket[bucket] = records_by_bucket.get(bucket, 0) + 1
-        tokens_by_bucket[bucket] = tokens_by_bucket.get(bucket, 0) + int(
-            row.get("estimated_tokens") or 0
+def _index_output(
+    output_path: Path, connection: sqlite3.Connection, include_sets: bool,
+) -> tuple[dict[str, Any], set[str], set[str]]:
+    """Cache aggregates and dedup keys; JSONL remains the durable authority.
+
+    Reuse an unchanged file, or parse only its appended suffix. Replacement,
+    truncation and in-place rewrites invalidate the index. Boundary hashes also
+    guard against a replaced prefix when the file grows.
+    """
+    connection.execute("CREATE TABLE IF NOT EXISTS snapshot (payload TEXT NOT NULL)")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS dedup (prompt_id TEXT NOT NULL, text_hash TEXT NOT NULL, "
+        "PRIMARY KEY (prompt_id, text_hash))"
+    )
+    saved = connection.execute("SELECT payload FROM snapshot").fetchone()
+    snapshot = json.loads(saved[0]) if saved else {}
+    stat = output_path.stat()
+    identity = [stat.st_dev, stat.st_ino]
+    offset = int(snapshot.get("offset", 0))
+    with output_path.open("rb") as source:
+        def boundary_hash(position: int) -> str:
+            source.seek(max(0, position - 4096))
+            return hashlib.sha256(source.read(min(position, 4096))).hexdigest()
+
+        valid = (
+            snapshot.get("version") == 1
+            and snapshot.get("identity") == identity
+            and stat.st_size >= offset
+            and (stat.st_size > offset or snapshot.get("mtime_ns") == stat.st_mtime_ns)
+            and snapshot.get("tail_hash") == boundary_hash(offset)
+            and snapshot.get("head_hash") == boundary_hash(min(offset, 4096))
         )
-        if fingerprint:
-            fingerprints.add(fingerprint)
-        last_record_id = row.get("id") or last_record_id
-    state: dict[str, Any] = {
-        "records": records,
-        "estimated_tokens": estimated_tokens,
-        "source_index": source_index,
-        "records_by_bucket": records_by_bucket,
-        "estimated_tokens_by_bucket": tokens_by_bucket,
-    }
-    if last_record_id is not None:
-        state["last_record_id"] = last_record_id
-    if len(source_models) == 1:
-        state["source_model"] = next(iter(source_models))
-    if len(fingerprints) == 1:
-        state["generation_fingerprint"] = next(iter(fingerprints))
-    elif len(fingerprints) > 1:
-        raise RuntimeError(f"teacher output contains multiple generation fingerprints: {sorted(fingerprints)}")
-    return state
+        if valid:
+            state = snapshot["state"]
+            fingerprints = set(snapshot["fingerprints"])
+            source_models = set(snapshot["source_models"])
+        else:
+            offset = 0
+            connection.execute("DELETE FROM dedup")
+            state = {
+                "records": 0, "estimated_tokens": 0, "source_index": 0,
+                "records_by_bucket": {}, "estimated_tokens_by_bucket": {},
+            }
+            fingerprints = set()
+            source_models = set()
+        source.seek(offset)
+        while source.tell() < stat.st_size:
+            line = source.readline()
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            state["records"] += 1
+            tokens = int(row.get("estimated_tokens") or 0)
+            state["estimated_tokens"] += tokens
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            state["source_index"] = max(
+                state["source_index"], int(metadata.get("source_index") or state["records"])
+            )
+            bucket = str(metadata.get("bucket") or "unknown")
+            counts = state["records_by_bucket"]
+            counts[bucket] = counts.get(bucket, 0) + 1
+            counts = state["estimated_tokens_by_bucket"]
+            counts[bucket] = counts.get(bucket, 0) + tokens
+            if row.get("id"):
+                state["last_record_id"] = row["id"]
+            model = str(row.get("source_model") or "").strip()
+            if model:
+                source_models.add(model)
+            fingerprint = str(metadata.get("generation_fingerprint") or "")
+            if fingerprint:
+                fingerprints.add(fingerprint)
+            text_hash = hashlib.sha256(
+                re.sub(r"\s+", " ", str(row.get("text") or "")).strip().encode("utf-8")
+            ).hexdigest()
+            connection.execute(
+                "INSERT OR IGNORE INTO dedup VALUES (?, ?)",
+                (str(metadata.get("prompt_record_id") or ""), text_hash),
+            )
+        if len(fingerprints) > 1:
+            raise RuntimeError(
+                f"teacher output contains multiple generation fingerprints: {sorted(fingerprints)}"
+            )
+        state.pop("source_model", None)
+        if len(source_models) == 1:
+            state["source_model"] = next(iter(source_models))
+        if fingerprints:
+            state["generation_fingerprint"] = next(iter(fingerprints))
+        if not valid or stat.st_size != offset:
+            snapshot = {
+                "version": 1, "identity": identity, "offset": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "head_hash": boundary_hash(min(stat.st_size, 4096)),
+                "tail_hash": boundary_hash(stat.st_size), "state": state,
+                "fingerprints": sorted(fingerprints), "source_models": sorted(source_models),
+            }
+            connection.execute("DELETE FROM snapshot")
+            connection.execute("INSERT INTO snapshot VALUES (?)", (json.dumps(snapshot),))
+            connection.commit()
+    prompt_ids: set[str] = set()
+    text_hashes: set[str] = set()
+    if include_sets:
+        for prompt_id, text_hash in connection.execute("SELECT prompt_id, text_hash FROM dedup"):
+            if prompt_id:
+                prompt_ids.add(prompt_id)
+            text_hashes.add(text_hash)
+    return state, prompt_ids, text_hashes
+
+
+def _read_output_resume(
+    output_path: Path | None, include_sets: bool = False,
+) -> tuple[dict[str, Any], set[str], set[str]]:
+    if output_path is None or not output_path.exists():
+        return {"records": 0, "estimated_tokens": 0, "source_index": 0}, set(), set()
+    _repair_jsonl_tail(output_path)
+    index_path = output_path.with_name(output_path.name + ".resume.sqlite3")
+    try:
+        connection = sqlite3.connect(index_path)
+        try:
+            return _index_output(output_path, connection, include_sets)
+        finally:
+            connection.close()
+    except (sqlite3.DatabaseError, OSError):
+        # A missing/writable/corrupt cache must never prevent recovery from JSONL.
+        connection = sqlite3.connect(":memory:")
+        try:
+            return _index_output(output_path, connection, include_sets)
+        finally:
+            connection.close()
+
+
+def progress_from_output(output_path: Path) -> dict[str, Any]:
+    return _read_output_resume(output_path)[0]
 
 
 def read_progress(
@@ -825,17 +925,7 @@ def _cool_down_after_failure_streak(
 
 
 def _existing_output_sets(output_path: Path | None) -> tuple[set[str], set[str]]:
-    prompt_ids: set[str] = set()
-    text_hashes: set[str] = set()
-    if output_path is None or not output_path.exists():
-        return prompt_ids, text_hashes
-    _repair_jsonl_tail(output_path)
-    for row in iter_jsonl(output_path):
-        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        prompt_id = str(metadata.get("prompt_record_id") or "")
-        if prompt_id:
-            prompt_ids.add(prompt_id)
-        text_hashes.add(hashlib.sha256(re.sub(r"\s+", " ", str(row.get("text") or "")).strip().encode("utf-8")).hexdigest())
+    _, prompt_ids, text_hashes = _read_output_resume(output_path, include_sets=True)
     return prompt_ids, text_hashes
 
 
@@ -1895,7 +1985,16 @@ def main() -> None:
         )
         configured_min_tokens = int(source_config.get("teacher_output_filters", {}).get("min_estimated_tokens", 8))
 
+    startup_started = time.monotonic()
+    print("[startup] Loading tokenizer dependencies...", flush=True)
     from transformers import AutoConfig, AutoTokenizer
+
+    print(
+        f"[startup] Loading tokenizer {args.tokenizer} "
+        f"(dependencies: {time.monotonic() - startup_started:.2f}s)...",
+        flush=True,
+    )
+    tokenizer_started = time.monotonic()
 
     tokenizer_revision = ""
     try:
@@ -1912,6 +2011,10 @@ def main() -> None:
         trust_remote_code=True,
         revision=tokenizer_revision or None,
         fix_broken_tokenizers=True,
+    )
+    print(
+        f"[startup] Tokenizer ready in {time.monotonic() - tokenizer_started:.2f}s",
+        flush=True,
     )
 
     def exact_token_count(text: str) -> int:
@@ -1970,8 +2073,15 @@ def main() -> None:
         resume_base_url=args.resume_base_url,
         allow_resume_fingerprint=args.allow_resume_fingerprint,
     )
+    resume_started = time.monotonic()
+    print("[startup] Reconciling output resume index...", flush=True)
     _repair_jsonl_tail(args.output)
     initial_state = read_progress(args.progress, output_path=args.output)
+    print(
+        f"[startup] Resume index ready in {time.monotonic() - resume_started:.2f}s "
+        f"({int(initial_state.get('records', 0)):,} records)",
+        flush=True,
+    )
     initial_records = int(initial_state.get("records", 0))
     initial_tokens = int(initial_state.get("estimated_tokens", 0))
 
