@@ -749,7 +749,7 @@ def test_build_shards_writes_exact_manifest_and_provenance(tmp_path: Path, monke
                             canvas_length=4, prefix_length=16, shard_blocks=2)
     assert complete["blocks_written"] == 4
     assert verify_shards(tmp_path / "all-blocks", canvas_length=4, expected_blocks=4)["exact"]
-    assert complete["schema_version"] == 4
+    assert complete["schema_version"] == 5
     assert complete["noise_policy"] == "online_only"
     for entry in complete["files"]:
         with np.load(tmp_path / "all-blocks" / entry["name"], allow_pickle=False) as shard:

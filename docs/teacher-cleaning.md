@@ -26,7 +26,11 @@ DG_TARGET_BLOCKS=0 bash scripts/linux/corrupt.sh
 
 全量製作先掃描 JSONL 計算總筆數，進度條顯示筆數、百分比、速度、ETA 和累計 blocks。ETA 估算資料處理階段；最後寫檔及驗證另有階段提示。
 
-新版 shards 使用 schema 4，只保存乾淨的 prompt、target、媒體張量、記錄資訊和 tokenizer 詞表大小，不產生或保存 `corrupted_ids`、`corruption_masks`、`noise_t`。訓練及 forward 驗證時才即時加噪。離線噪聲選項與讀取分支已移除；訓練依 seed、epoch、shard 和 row 確定噪聲，同一 epoch 可重現，下一 epoch 重新取樣。schema 與資料指紋已更新，重新執行相同製作命令會建立新版 shards，不續接舊版帶噪資料的 checkpoint；舊暫存會保留在原目錄。
+新版 shards 使用 schema 5，只保存乾淨的 prompt、target、媒體索引、記錄資訊和 tokenizer 詞表大小，不產生或保存 `corrupted_ids`、`corruption_masks`、`noise_t`。圖片／音訊及其位置／特徵遮罩張量使用內容 SHA-256 命名，壓縮存於輸出目錄的 `media/`；相同張量跨 block、record、shard 只存一份。隨 prompt 長度改變的 `mm_token_type_ids` 仍保存於各 block。搬移訓練資料時必須連同 `media/` 一起搬移；驗證會檢查引用檔案與內容雜湊，訓練指紋也涵蓋媒體檔案。此去重不改變浮點張量數值。
+
+訓練及 forward 驗證時才即時加噪。離線噪聲選項與讀取分支已移除；訓練依 seed、epoch、shard 和 row 確定噪聲，同一 epoch 可重現，下一 epoch 重新取樣。schema 與資料指紋已更新，重新執行相同製作命令會建立新版 shards，不續接 schema 4 或舊版帶噪資料的 checkpoint；舊暫存會保留在原目錄。讀取端仍支援 schema 4 的乾淨內嵌媒體 shards。
+
+寫入前會檢查磁碟可用空間，並計入同時寫檔的保守預算；預設保留 2 GiB，空間不足時停止並保留最近成功的 checkpoint。釋放空間後可續跑。Linux/Windows 使用 `DG_MIN_FREE_DISK_BYTES`，CLI 使用 `--min-free-disk-bytes`；此限制可在續跑時調整。`DG_MAX_MULTIMODAL_SHARD_BYTES`／`--max-multimodal-bytes` 是已棄用的相容參數，並非磁碟容量保護；`multimodal_uncompressed_bytes` 統計的是各 block 的邏輯張量大小，包含共用張量的重複引用，不等於實際檔案用量。
 
 Linux/Windows 腳本預設使用全部可用 CPU：多程序執行 tokenizer 與媒體預處理，多執行緒壓縮、寫入及驗證 shards。Linux worker 繼承載入好的 tokenizer/processor，避免逐 worker 複製大型詞表。主程序依輸入順序收取結果，保持資料與續跑一致。預取及尚未完成的寫檔數量都有界限。
 

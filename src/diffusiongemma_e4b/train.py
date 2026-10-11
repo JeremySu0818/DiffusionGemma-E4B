@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
+from .shard_media import load_media_row
 
 
 MULTIMODAL_BATCH_KEYS = (
@@ -57,12 +58,13 @@ class TrainState:
 
 def corruption_data_fingerprint(data_dir: Path) -> str:
     """Hash NPZ member CRCs and sizes without decompressing every tensor."""
-    files = sorted(data_dir.glob("corruption_*.npz"))
-    if not files:
+    shard_files = sorted(data_dir.glob("corruption_*.npz"))
+    if not shard_files:
         raise FileNotFoundError(f"no corruption_*.npz files in {data_dir}")
+    files = shard_files + sorted((data_dir / "media").glob("*.npz"))
     digest = hashlib.sha256()
     for path in files:
-        digest.update(path.name.encode("utf-8"))
+        digest.update(path.relative_to(data_dir).as_posix().encode("utf-8"))
         try:
             with zipfile.ZipFile(path) as archive:
                 for member in sorted(archive.infolist(), key=lambda item: item.filename):
@@ -291,9 +293,9 @@ class CorruptionShardDataset(Dataset):
     def _optional_multimodal_tensors(self, shard, row: int) -> dict[str, torch.Tensor]:
         tensors: dict[str, torch.Tensor] = {}
         for key in MULTIMODAL_BATCH_KEYS:
-            if key not in shard:
+            value = load_media_row(self.data_dir, shard, key, row)
+            if value is None:
                 continue
-            value = shard[key][row]
             dtype = np.float32 if key in {"pixel_values", "input_features"} else np.int64
             tensors[key] = torch.from_numpy(value.astype(dtype))
         return tensors

@@ -14,6 +14,7 @@ $seed = if ($env:DG_SEED) { $env:DG_SEED } else { "1337" }
 $recordOrder = if ($env:DG_RECORD_ORDER) { $env:DG_RECORD_ORDER } else { "shuffled" }
 $workers = if ($env:DG_CORRUPTION_WORKERS) { $env:DG_CORRUPTION_WORKERS } else { "0" }
 $prefetch = if ($env:DG_CORRUPTION_PREFETCH) { $env:DG_CORRUPTION_PREFETCH } else { "0" }
+$diskReserve = if ($env:DG_MIN_FREE_DISK_BYTES) { $env:DG_MIN_FREE_DISK_BYTES } else { "2147483648" }
 $nativeThreads = if ($env:DG_CORRUPTION_NATIVE_THREADS) { $env:DG_CORRUPTION_NATIVE_THREADS } else { "1" }
 $env:OMP_NUM_THREADS = $nativeThreads
 $env:MKL_NUM_THREADS = $nativeThreads
@@ -34,4 +35,5 @@ python -m diffusiongemma_e4b.corruption `
   --record-order $recordOrder `
   --num-workers $workers `
   --prefetch-records $prefetch `
+  --min-free-disk-bytes $diskReserve `
   --dataset-config $datasetConfig

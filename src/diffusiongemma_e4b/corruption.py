@@ -20,6 +20,7 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from .constants import CANVAS_LENGTH, DEFAULT_DIFFUSION_REFERENCE, DEFAULT_PREFIX_LENGTH
+from .shard_media import DiskBudget, MediaStore, SHARED_MEDIA_KEYS, verify_media_references
 
 
 MULTIMODAL_SHARD_KEYS = (
@@ -277,6 +278,8 @@ def _write_shard(
     prefix_length: int,
     pad_token_id: int = 0,
     vocab_size: int | None = None,
+    media_store: MediaStore | None = None,
+    disk_budget: DiskBudget | None = None,
 ) -> Path:
     if vocab_size is None or vocab_size <= 0:
         raise ValueError("clean shards require the tokenizer vocab_size")
@@ -305,12 +308,19 @@ def _write_shard(
     arrays["vocab_size"] = np.array([vocab_size], dtype=np.int64)
     for key in MULTIMODAL_SHARD_KEYS:
         if key in examples[0]:
-            arrays[key] = padded(key, 0) if key == "mm_token_type_ids" else np.stack([ex[key] for ex in examples])
+            if media_store is not None and key in SHARED_MEDIA_KEYS:
+                arrays[key + "_refs"] = np.asarray([media_store.put(key, ex[key]) for ex in examples])
+            else:
+                arrays[key] = padded(key, 0) if key == "mm_token_type_ids" else np.stack([ex[key] for ex in examples])
     shard_path = output_dir / f"corruption_{family}_{shard_id:06d}.npz"
     fd, temp_name = tempfile.mkstemp(prefix=f".{shard_path.stem}.", suffix=".npz", dir=output_dir)
     os.close(fd)
     try:
-        np.savez_compressed(temp_name, **arrays)
+        if disk_budget is None:
+            np.savez_compressed(temp_name, **arrays)
+        else:
+            with disk_budget.claim(sum(value.nbytes for value in arrays.values())):
+                np.savez_compressed(temp_name, **arrays)
         with Path(temp_name).open("rb") as f:
             os.fsync(f.fileno())
         os.replace(temp_name, shard_path)
@@ -376,7 +386,7 @@ def _scan_jsonl(path: Path) -> tuple[str, int]:
 
 
 def _build_fingerprint(raw_sha256: str, **kwargs: Any) -> str:
-    payload = {"schema": 4, "raw_jsonl_sha256": raw_sha256, **kwargs}
+    payload = {"schema": 5, "raw_jsonl_sha256": raw_sha256, **kwargs}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -491,11 +501,14 @@ def build_shards(
     source_names: set[str] | None = None,
     num_workers: int = 1,
     prefetch_records: int = 0,
+    min_free_disk_bytes: int = 2 * 1024**3,
 ) -> dict[str, Any]:
     if num_workers < 0 or prefetch_records < 0:
         raise ValueError("num_workers and prefetch_records must be nonnegative")
     num_workers = num_workers or _cpu_workers()
     prefetch_records = prefetch_records or num_workers
+    if min_free_disk_bytes < 0:
+        raise ValueError("min_free_disk_bytes must be nonnegative")
     if not raw_jsonl.is_file():
         raise FileNotFoundError(raw_jsonl)
     tokenizer_config = AutoConfig.from_pretrained(
@@ -623,6 +636,8 @@ def build_shards(
     )
     if record_progress:
         pbar.set_postfix(blocks=blocks_written, refresh=False)
+    disk_budget = DiskBudget(staging, min_free_disk_bytes)
+    media_store = MediaStore(staging, disk_budget)
     executor = ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="shard-write") if num_workers > 1 else None
     pending_writes = deque()
     cancel_preparation = threading.Event()
@@ -672,7 +687,8 @@ def build_shards(
         buffer_bytes[sig] = 0
         def write():
             path = _write_shard(staging, family, shard_id, examples, canvas_length, prefix_length,
-                                pad_token_id, vocab_size=vocab_size)
+                                pad_token_id, vocab_size=vocab_size, media_store=media_store,
+                                disk_budget=disk_budget)
             return {"name": path.name, "family": family, "rows": len(examples),
                     "bytes": path.stat().st_size, "sha256": _sha256_file(path)}
         if executor is None:
@@ -816,7 +832,8 @@ def build_shards(
     verify_shards(staging, min_blocks=target_blocks, canvas_length=canvas_length,
                   expected_blocks=blocks_written, num_workers=num_workers)
     manifest: dict[str, Any] = {
-        "schema_version": 4,
+        "schema_version": 5,
+        "media_storage": "content_addressed_npz",
         "noise_policy": "online_only",
         "vocab_size": vocab_size,
         "pad_token_id": pad_token_id,
@@ -887,6 +904,8 @@ def verify_shards(
     if not files:
         raise ValueError(f"no corruption shards found in {output_dir}")
     entries = {item["name"]: item for item in manifest["files"]} if manifest is not None else {}
+    verified_media: set[str] = set()
+    media_verify_lock = threading.Lock()
 
     def verify_file(path):
         if not path.is_file():
@@ -927,6 +946,8 @@ def verify_shards(
                 raise ValueError(f"{path} pixel_values row count mismatch")
             if "input_features" in shard and shard["input_features"].shape[0] != rows:
                 raise ValueError(f"{path} input_features row count mismatch")
+            with media_verify_lock:
+                verify_media_references(output_dir, shard, rows, verified_media)
             return rows
     if num_workers > 1:
         with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="shard-verify") as pool:
@@ -956,6 +977,8 @@ def main() -> None:
     parser.add_argument("--max-multimodal-bytes", type=int, default=0,
                         help="Deprecated compatibility option; cumulative media bytes no longer stop dataset creation.")
     parser.add_argument("--max-shard-uncompressed-bytes", type=int, default=2 * 1024**3)
+    parser.add_argument("--min-free-disk-bytes", type=int, default=2 * 1024**3,
+                        help="Keep this much disk space free; includes reservations for concurrent writes.")
     parser.add_argument("--dataset-config", type=Path, default=None)
     parser.add_argument("--sources", default="")
     parser.add_argument("--num-workers", type=int, default=0,
@@ -994,6 +1017,7 @@ def main() -> None:
             {item.strip() for item in args.sources.split(",") if item.strip()} or None,
             num_workers=args.num_workers,
             prefetch_records=args.prefetch_records,
+            min_free_disk_bytes=args.min_free_disk_bytes,
         )
     print(json.dumps(result, indent=2))
 

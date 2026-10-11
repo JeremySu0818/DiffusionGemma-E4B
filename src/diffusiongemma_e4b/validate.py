@@ -14,6 +14,7 @@ import transformers
 from .constants import CANVAS_LENGTH
 from .infer import MULTIMODAL_BATCH_KEYS, _model_input_device, load_model_and_processor
 from .train import corruption_data_fingerprint, sample_token_noise
+from .shard_media import load_media_row, verify_media_references
 
 
 def _package_versions() -> dict[str, str | None]:
@@ -131,6 +132,7 @@ def validate_shards(data_dir: Path, expected_canvas_length: int = CANVAS_LENGTH)
     record_ids: set[str] = set()
     families: dict[str, int] = {}
     buckets: dict[str, int] = {}
+    verified_media: set[str] = set()
     for path in files:
         with np.load(path, allow_pickle=False) as shard:
             if {"corrupted_ids", "corruption_masks", "noise_t"}.intersection(shard.files):
@@ -143,6 +145,7 @@ def validate_shards(data_dir: Path, expected_canvas_length: int = CANVAS_LENGTH)
             if target.ndim != 2 or target.shape[1] != expected_canvas_length:
                 raise ValueError(f"{path} target shape {target.shape} does not match canvas {expected_canvas_length}")
             rows = int(target.shape[0])
+            verify_media_references(data_dir, shard, rows, verified_media)
             if shard["prefix_ids"].shape[0] != rows or shard["prefix_lens"].shape[0] != rows:
                 raise ValueError(f"{path} prefix row count differs from targets")
             valid = target != -100
@@ -212,9 +215,10 @@ def _first_batch(data_dir: Path) -> dict[str, torch.Tensor]:
             "corruption_mask": torch.from_numpy(corruption_mask),
         }
         for key in MULTIMODAL_BATCH_KEYS:
-            if key not in shard:
+            value = load_media_row(data_dir, shard, key, 0)
+            if value is None:
                 continue
-            value = shard[key][:1]
+            value = value[None]
             if key in {"pixel_values", "input_features"}:
                 batch[key] = torch.from_numpy(value.astype(np.float32))
             else:

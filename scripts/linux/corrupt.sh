@@ -26,5 +26,6 @@ python -m diffusiongemma_e4b.corruption \
   --prefetch-records "${DG_CORRUPTION_PREFETCH:-0}" \
   --max-multimodal-bytes "${DG_MAX_MULTIMODAL_SHARD_BYTES:-68719476736}" \
   --max-shard-uncompressed-bytes "${DG_MAX_SHARD_UNCOMPRESSED_BYTES:-536870912}" \
+  --min-free-disk-bytes "${DG_MIN_FREE_DISK_BYTES:-2147483648}" \
   --dataset-config "${DG_DATASET_CONFIG:-configs/dataset_sources.json}" \
   --sources "${DG_DATASET_SOURCES:-}"
