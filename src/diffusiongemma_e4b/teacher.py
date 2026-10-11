@@ -52,6 +52,7 @@ class TeacherConfig:
     offline_mode: bool = False
     resume_base_url: str | None = None
     allow_resume_fingerprint: str | None = None
+    outstanding_multiplier: int = 4
 
 
 class TeacherClient:
@@ -69,11 +70,13 @@ class _TeacherResponse(str):
         completion_tokens: int | None = None,
         request_seconds: float | None = None,
         generation_seconds: float | None = None,
+        finish_reason: str | None = None,
     ) -> "_TeacherResponse":
         value = super().__new__(cls, text)
         value.completion_tokens = completion_tokens
         value.request_seconds = request_seconds
         value.generation_seconds = generation_seconds
+        value.finish_reason = finish_reason
         return value
 
 
@@ -84,6 +87,9 @@ class _GenerationResult:
     request_started: float
     request_finished: float
     generation_seconds: float | None = None
+    estimated_tokens: int | None = None
+    input_tokens: int | None = None
+    finish_reason: str | None = None
 
     @property
     def request_seconds(self) -> float:
@@ -100,6 +106,12 @@ class _ThroughputMeter:
         self._request_tokens: dict[int, dict[int, float]] = {}
         self._next_request_id = 0
         self._lock = threading.Lock()
+        self.pipeline_snapshot: Callable[[], dict[str, int]] | None = None
+
+    @property
+    def active_requests(self) -> int:
+        with self._lock:
+            return len(self._request_tokens)
 
     def begin_request(self) -> int:
         with self._lock:
@@ -228,6 +240,7 @@ class OpenAICompletionsClient(TeacherClient):
             response.raise_for_status()
             parts: list[str] = []
             completion_tokens: int | None = None
+            finish_reason: str | None = None
             for raw_line in response.iter_lines(decode_unicode=True):
                 line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
                 line = str(line or "").strip()
@@ -244,6 +257,8 @@ class OpenAICompletionsClient(TeacherClient):
                 choices = event.get("choices") if isinstance(event, dict) else None
                 if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
                     continue
+                if choices[0].get("finish_reason") is not None:
+                    finish_reason = choices[0]["finish_reason"]
                 delta = choices[0].get("delta")
                 content = delta.get("content") if isinstance(delta, dict) else None
                 reasoning = (
@@ -263,6 +278,7 @@ class OpenAICompletionsClient(TeacherClient):
         return _TeacherResponse(
             "".join(parts).strip(),
             completion_tokens=completion_tokens,
+            finish_reason=finish_reason,
             request_seconds=request_seconds,
         )
 
@@ -315,6 +331,7 @@ class OllamaGenerateClient(TeacherClient):
             completion_tokens=completion_tokens,
             request_seconds=request_seconds,
             generation_seconds=generation_seconds,
+            finish_reason=data.get("done_reason"),
         )
 
 
@@ -597,7 +614,7 @@ def _repair_jsonl_tail(path: Path) -> None:
 
 def _index_output(
     output_path: Path, connection: sqlite3.Connection, include_sets: bool,
-) -> tuple[dict[str, Any], set[str], set[str]]:
+) -> tuple[dict[str, Any], set[str]]:
     """Cache aggregates and dedup keys; JSONL remains the durable authority.
 
     Reuse an unchanged file, or parse only its appended suffix. Replacement,
@@ -666,12 +683,9 @@ def _index_output(
             fingerprint = str(metadata.get("generation_fingerprint") or "")
             if fingerprint:
                 fingerprints.add(fingerprint)
-            text_hash = hashlib.sha256(
-                re.sub(r"\s+", " ", str(row.get("text") or "")).strip().encode("utf-8")
-            ).hexdigest()
             connection.execute(
                 "INSERT OR IGNORE INTO dedup VALUES (?, ?)",
-                (str(metadata.get("prompt_record_id") or ""), text_hash),
+                (str(metadata.get("prompt_record_id") or ""), ""),
             )
         if len(fingerprints) > 1:
             raise RuntimeError(
@@ -694,20 +708,18 @@ def _index_output(
             connection.execute("INSERT INTO snapshot VALUES (?)", (json.dumps(snapshot),))
             connection.commit()
     prompt_ids: set[str] = set()
-    text_hashes: set[str] = set()
     if include_sets:
-        for prompt_id, text_hash in connection.execute("SELECT prompt_id, text_hash FROM dedup"):
+        for (prompt_id,) in connection.execute("SELECT DISTINCT prompt_id FROM dedup"):
             if prompt_id:
                 prompt_ids.add(prompt_id)
-            text_hashes.add(text_hash)
-    return state, prompt_ids, text_hashes
+    return state, prompt_ids
 
 
 def _read_output_resume(
     output_path: Path | None, include_sets: bool = False,
-) -> tuple[dict[str, Any], set[str], set[str]]:
+) -> tuple[dict[str, Any], set[str]]:
     if output_path is None or not output_path.exists():
-        return {"records": 0, "estimated_tokens": 0, "source_index": 0}, set(), set()
+        return {"records": 0, "estimated_tokens": 0, "source_index": 0}, set()
     _repair_jsonl_tail(output_path)
     index_path = output_path.with_name(output_path.name + ".resume.sqlite3")
     try:
@@ -783,7 +795,7 @@ def save_progress(progress_path: Path, state: dict[str, Any]) -> None:
 def _build_prompt(record: dict[str, Any]) -> str:
     prompt = str(record.get("prompt_text") or record.get("prompt") or "").strip()
     context = str(record.get("context_text") or record.get("context") or "").strip()
-    if context and prompt:
+    if context and prompt and context != prompt:
         return f"Context:\n{context}\n\nRequest:\n{prompt}"
     if context:
         return context
@@ -809,17 +821,10 @@ def _validated_teacher_text(
     text = text.strip()
     if not text:
         raise ValueError("teacher returned empty text")
-    normalized = re.sub(r"\s+", " ", text).strip().casefold()
-    prompt_normalized = re.sub(r"\s+", " ", prompt).strip().casefold()
-    if normalized == prompt_normalized:
-        raise ValueError("teacher echoed the prompt without an answer")
     # HTTP failures are checked by the client. Only reject a bare error message
     # here: answers may legitimately explain HTTP errors or contain HTML code.
     if _ENDPOINT_FAILURE_RE.fullmatch(text):
         raise ValueError("teacher output contains endpoint failure text")
-    words = normalized.split()
-    if len(words) >= 32 and len(set(words)) / len(words) < 0.08:
-        raise ValueError("teacher output is pathologically repetitive")
     return text
 
 
@@ -890,6 +895,7 @@ def _generate_with_retry(
                 request_started=request_started,
                 request_finished=request_finished,
                 generation_seconds=getattr(raw, "generation_seconds", None),
+                finish_reason=getattr(raw, "finish_reason", None),
             )
         except (requests.RequestException, ValueError, RuntimeError, OSError) as exc:
             if throughput is not None and request_id is not None:
@@ -903,30 +909,8 @@ def _generate_with_retry(
     raise RuntimeError("teacher generation failed after retries: " + " | ".join(errors))
 
 
-def _cool_down_after_failure_streak(
-    cfg: TeacherConfig,
-    state: dict[str, Any],
-    consecutive_failures: int,
-) -> int:
-    """Apply backpressure after repeated failures without aborting generation."""
-    threshold = max(1, cfg.max_consecutive_failures)
-    if consecutive_failures < threshold:
-        return consecutive_failures
-
-    state["failure_cooldowns"] = int(state.get("failure_cooldowns", 0)) + 1
-    state["consecutive_failures"] = 0
-    if cfg.retry_base_s > 0:
-        cooldown = min(
-            30.0,
-            random.uniform(0.5, 1.5) * cfg.retry_base_s * min(threshold, 5),
-        )
-        time.sleep(cooldown)
-    return 0
-
-
-def _existing_output_sets(output_path: Path | None) -> tuple[set[str], set[str]]:
-    _, prompt_ids, text_hashes = _read_output_resume(output_path, include_sets=True)
-    return prompt_ids, text_hashes
+def _existing_prompt_ids(output_path: Path | None) -> set[str]:
+    return _read_output_resume(output_path, include_sets=True)[1]
 
 
 def _record_bucket(prompt_record: dict[str, Any]) -> str:
@@ -936,10 +920,6 @@ def _record_bucket(prompt_record: dict[str, Any]) -> str:
         else {}
     )
     return str(prompt_record.get("bucket") or metadata.get("bucket") or "unknown")
-
-
-def _identity_prompt_limiter(prompt: str, _media: dict[str, Any]) -> str:
-    return prompt
 
 
 def _commit_bucket_progress(
@@ -983,19 +963,6 @@ def validate_generated_mix(
     actual_shares = {
         bucket: actual_counts.get(bucket, 0) / total for bucket in expected
     }
-    severely_underfilled = {
-        bucket: {
-            "expected_prompt_share": share,
-            "actual_prompt_share": actual_shares[bucket],
-        }
-        for bucket, share in expected.items()
-        if actual_shares[bucket] + (1.0 / total) < share * 0.5
-    }
-    if severely_underfilled:
-        raise RuntimeError(
-            "teacher success rates distorted the required prompt mixture by more "
-            f"than 50%: {severely_underfilled}"
-        )
     return {
         "expected_prompt_shares": expected,
         "actual_prompt_shares": actual_shares,
@@ -1014,7 +981,6 @@ def _generate_records_sync(
     output_path: Path | None = None,
     data_fingerprint: str = "",
     token_counter: Callable[[str], int] = estimate_tokens,
-    prompt_limiter: Callable[[str, dict[str, Any]], str] = _identity_prompt_limiter,
     throughput: _ThroughputMeter | None = None,
 ) -> Iterable[TeacherSupervisedRecord]:
     client = make_client(cfg)
@@ -1032,7 +998,7 @@ def _generate_records_sync(
     state.setdefault("source_index", 0)
     state.setdefault("filtered_records", 0)
     save_progress(progress_path, state)
-    existing_prompt_ids, seen_text_hashes = _existing_output_sets(output_path)
+    existing_prompt_ids = _existing_prompt_ids(output_path)
     consecutive_failures = int(state.get("consecutive_failures", 0))
 
     for source_index, prompt_record in enumerate(prompt_records):
@@ -1046,7 +1012,6 @@ def _generate_records_sync(
         started = time.time()
         prompt = _build_prompt(prompt_record)
         media = dict(prompt_record.get("media") or {})
-        prompt = prompt_limiter(prompt, media)
         try:
             generation = _generate_with_retry(
                 client, cfg, prompt, media, token_counter, throughput
@@ -1059,22 +1024,11 @@ def _generate_records_sync(
             state["source_index"] = source_index + 1
             state["last_failed_prompt_id"] = prompt_record_id
             state["last_failure"] = str(exc)
-            consecutive_failures = _cool_down_after_failure_streak(
-                cfg, state, consecutive_failures
-            )
             save_progress(progress_path, state)
             continue
         consecutive_failures = 0
         state["consecutive_failures"] = 0
         tok = token_counter(text)
-        text_hash = hashlib.sha256(re.sub(r"\s+", " ", text).strip().encode("utf-8")).hexdigest()
-        if text_hash in seen_text_hashes:
-            state["filtered_records"] = int(state.get("filtered_records", 0)) + 1
-            state["source_index"] = source_index + 1
-            state["last_filter_reason"] = "duplicate_teacher_output"
-            save_progress(progress_path, state)
-            continue
-
         metadata = {str(k): v for k, v in dict(prompt_record.get("metadata") or {}).items()}
         metadata.update(
             {
@@ -1086,8 +1040,10 @@ def _generate_records_sync(
                 "teacher_temperature": cfg.temperature,
                 "teacher_top_p": cfg.top_p,
                 "teacher_max_tokens": cfg.max_tokens,
+                "teacher_input_policy": "full_stored_prompt",
                 "teacher_input_tokens": token_counter(prompt),
                 "teacher_completion_tokens": generation.completion_tokens,
+                "teacher_finish_reason": generation.finish_reason,
                 "teacher_request_seconds": round(generation.request_seconds, 6),
                 "teacher_generation_seconds": (
                     round(generation.generation_seconds, 6)
@@ -1119,7 +1075,6 @@ def _generate_records_sync(
         # The caller appends and fsyncs this record before requesting the next
         # generator item. State is committed only after that durable append.
         yield record
-        seen_text_hashes.add(text_hash)
         existing_prompt_ids.add(prompt_record_id)
         state["records"] = int(state["records"]) + 1
         state["estimated_tokens"] = int(state["estimated_tokens"]) + tok
@@ -1149,13 +1104,6 @@ class _PendingGeneration:
 
 
 _worker_local = threading.local()
-
-# A streaming dataset can take a little while to open the next shard, but it
-# must never leave the generation scheduler waiting forever with LM Studio
-# idle.  Keep this deliberately finite so the progress file and terminal say
-# which side of the pipeline is stalled.
-_PROMPT_PREFETCH_STALL_TIMEOUT_S = 900.0
-
 
 class _DiskPromptQueue:
     """A bounded, resumable cross-thread queue whose payloads live on disk."""
@@ -1227,9 +1175,15 @@ class _DiskPromptQueue:
         self._writer.commit()
         row = self._writer.execute("SELECT COUNT(*) FROM prompts").fetchone()
         self._active_records = int(row[0]) if row else 0
+        self._queued_records = self._active_records
 
     def _active_count(self) -> int:
         return self._active_records
+
+    @property
+    def ready_count(self) -> int:
+        with self._condition:
+            return self._queued_records
 
     def put(self, source_index: int, prompt_record: dict[str, Any], stop: threading.Event) -> bool:
         payload = json.dumps(prompt_record, ensure_ascii=False, separators=(",", ":"))
@@ -1245,7 +1199,8 @@ class _DiskPromptQueue:
                 (prompt_key, source_index, payload),
             )
             self._writer.commit()
-            self._active_records += max(0, cursor.rowcount)
+            self._active_records += cursor.rowcount
+            self._queued_records += cursor.rowcount
             self._condition.notify_all()
             return True
 
@@ -1258,7 +1213,8 @@ class _DiskPromptQueue:
     def get(self, timeout: float = 0.0) -> tuple[int, dict[str, Any]] | None:
         # "inflight" is a durable lease until output acknowledgement, not an
         # active HTTP request count. It includes executor backlog and results
-        # waiting for the consumer; concurrent generation bounds it at 2 * C.
+        # waiting for the consumer; concurrent generation bounds this separately
+        # from the number of active API workers.
         deadline = time.monotonic() + timeout
         with self._condition:
             row = None
@@ -1286,6 +1242,7 @@ class _DiskPromptQueue:
                 "UPDATE prompts SET status = 'inflight' WHERE prompt_key = ?", (row[0],)
             )
             self._reader.commit()
+            self._queued_records -= 1
         return int(row[1]), json.loads(row[2])
 
     def acknowledge(self, prompt_key: str) -> None:
@@ -1301,6 +1258,7 @@ class _DiskPromptQueue:
         with self._condition:
             self._reader.execute("UPDATE prompts SET status = 'queued' WHERE status = 'inflight'")
             self._reader.commit()
+            self._queued_records = self._active_records
             self._condition.notify_all()
 
     @property
@@ -1323,7 +1281,7 @@ def _iter_disk_spooled_prompts(
     fingerprint: str,
 ) -> Iterable[dict[str, Any]]:
     """Prefetch prompts to SQLite while preserving main-thread generation."""
-    prefetch_size = max(cfg.prefetch_records, 2)
+    prefetch_size = cfg.prefetch_records
     spool_root = cfg.prefetch_dir or progress_path.parent / "prompt_spool"
     source_queue = _DiskPromptQueue(
         Path(spool_root), max_records=prefetch_size, fingerprint=fingerprint
@@ -1351,29 +1309,15 @@ def _iter_disk_spooled_prompts(
         daemon=True,
     )
     producer.start()
-    last_source_activity = time.monotonic()
     try:
         while True:
             item = source_queue.get(timeout=0.1)
             if item is None:
                 if source_queue.exhausted:
                     break
-                source_is_offline = bool(
-                    cfg.source_pause_state is not None and cfg.source_pause_state.paused
-                )
-                if (
-                    not source_is_offline
-                    and time.monotonic() - last_source_activity
-                    >= _PROMPT_PREFETCH_STALL_TIMEOUT_S
-                ):
-                    raise RuntimeError(
-                        "prompt source prefetch stalled for "
-                        f"{_PROMPT_PREFETCH_STALL_TIMEOUT_S:g}s; no new prompt was available"
-                    )
                 continue
             _, prompt_record = item
             prompt_key = str(prompt_record.get("id") or _sha256_json(prompt_record))
-            last_source_activity = time.monotonic()
             yield prompt_record
             source_queue.acknowledge(prompt_key)
     finally:
@@ -1421,9 +1365,12 @@ def _worker_generate(
         client = make_client(cfg)
         _worker_local.client = client
         _worker_local.client_cfg_id = id(cfg)
-    return _generate_with_retry(
+    result = _generate_with_retry(
         client, cfg, prompt, media, token_counter, throughput
     )
+    # Exact accounting can be expensive with hundreds of completions arriving
+    # together. Keep it off the single output consumer thread.
+    return replace(result, estimated_tokens=token_counter(result.text), input_tokens=token_counter(prompt))
 
 
 def _generate_records_concurrent(
@@ -1434,7 +1381,6 @@ def _generate_records_concurrent(
     output_path: Path | None = None,
     data_fingerprint: str = "",
     token_counter: Callable[[str], int] = estimate_tokens,
-    prompt_limiter: Callable[[str, dict[str, Any]], str] = _identity_prompt_limiter,
     throughput: _ThroughputMeter | None = None,
 ) -> Iterable[TeacherSupervisedRecord]:
     fingerprint = resolve_resume_fingerprint(
@@ -1451,7 +1397,7 @@ def _generate_records_concurrent(
     state.setdefault("source_index", 0)
     state.setdefault("filtered_records", 0)
     save_progress(progress_path, state)
-    existing_prompt_ids, seen_text_hashes = _existing_output_sets(output_path)
+    existing_prompt_ids = _existing_prompt_ids(output_path)
     scheduled_prompt_ids = set(existing_prompt_ids)
     consecutive_failures = int(state.get("consecutive_failures", 0))
     # Dataset streaming and media preparation may block on disk or the network.
@@ -1461,7 +1407,7 @@ def _generate_records_concurrent(
     # not leave local inference slots idle.  This is intentionally independent
     # of concurrency: four workers need more than eight ready prompts when a
     # remote shard pauses between records.
-    prefetch_size = max(cfg.prefetch_records, cfg.concurrency + 1)
+    prefetch_size = cfg.prefetch_records
     spool_root = cfg.prefetch_dir or progress_path.parent / "prompt_spool"
     source_stop = threading.Event()
 
@@ -1503,18 +1449,28 @@ def _generate_records_concurrent(
         )
         producer.start()
     source_exhausted = False
-    last_source_activity = time.monotonic()
     # Bound running + queued + completed work. A ready executor backlog lets a
     # worker start its next request without waiting for token accounting, fsync,
     # progress updates, or the generator's consumer.
-    capacity = threading.BoundedSemaphore(2 * cfg.concurrency)
+    capacity = threading.BoundedSemaphore(cfg.outstanding_multiplier * cfg.concurrency)
     pending: dict[str, _PendingGeneration] = {}
     pending_lock = threading.Lock()
     completions: queue.Queue[_PendingGeneration | BaseException | None] = queue.Queue()
     executor = ThreadPoolExecutor(max_workers=cfg.concurrency, thread_name_prefix="teacher-request")
 
+    def pipeline_snapshot() -> dict[str, int]:
+        with pending_lock:
+            futures = [item.future for item in pending.values()]
+        return {
+            "queued": sum(not f.running() and not f.done() for f in futures),
+            "done": sum(f.done() for f in futures),
+            "ready": source_queue.ready_count,
+        }
+
+    if throughput is not None:
+        throughput.pipeline_snapshot = pipeline_snapshot
+
     def dispatch() -> None:
-        nonlocal last_source_activity
         try:
             while not source_stop.is_set():
                 if not capacity.acquire(timeout=0.1):
@@ -1527,22 +1483,7 @@ def _generate_records_concurrent(
                     capacity.release()
                     if source_queue.exhausted:
                         break
-                    with pending_lock:
-                        idle = not pending
-                    source_is_offline = bool(
-                        cfg.source_pause_state is not None and cfg.source_pause_state.paused
-                    )
-                    if (
-                        idle
-                        and not source_is_offline
-                        and time.monotonic() - last_source_activity >= _PROMPT_PREFETCH_STALL_TIMEOUT_S
-                    ):
-                        raise RuntimeError(
-                            "prompt source prefetch stalled for "
-                            f"{_PROMPT_PREFETCH_STALL_TIMEOUT_S:g}s; no new prompt was available"
-                        )
                     continue
-                last_source_activity = time.monotonic()
                 source_index, prompt_record = source_item
                 prompt_record_id = str(prompt_record.get("id") or _sha256_json(prompt_record))
                 if prompt_record_id in scheduled_prompt_ids:
@@ -1551,7 +1492,6 @@ def _generate_records_concurrent(
                     continue
                 prompt = _build_prompt(prompt_record)
                 media = dict(prompt_record.get("media") or {})
-                prompt = prompt_limiter(prompt, media)
                 if source_stop.is_set():
                     capacity.release()
                     break
@@ -1615,27 +1555,12 @@ def _generate_records_concurrent(
                 state["last_failed_prompt_id"] = item.prompt_record_id
                 state["last_failure"] = str(exc)
                 source_queue.acknowledge(item.prompt_record_id)
-                consecutive_failures = _cool_down_after_failure_streak(
-                    cfg, state, consecutive_failures
-                )
                 save_progress(progress_path, state)
                 continue
 
             consecutive_failures = 0
             state["consecutive_failures"] = 0
-            tok = token_counter(text)
-            text_hash = hashlib.sha256(re.sub(r"\s+", " ", text).strip().encode("utf-8")).hexdigest()
-            if text_hash in seen_text_hashes:
-                retire(item)
-                state["filtered_records"] = int(state.get("filtered_records", 0)) + 1
-                state["source_index"] = max(
-                    int(state.get("source_index", 0)), item.source_index + 1
-                )
-                state["last_filter_reason"] = "duplicate_teacher_output"
-                save_progress(progress_path, state)
-                source_queue.acknowledge(item.prompt_record_id)
-                continue
-
+            tok = generation.estimated_tokens
             metadata = {str(k): v for k, v in dict(item.prompt_record.get("metadata") or {}).items()}
             metadata.update(
                 {
@@ -1647,8 +1572,10 @@ def _generate_records_concurrent(
                     "teacher_temperature": cfg.temperature,
                     "teacher_top_p": cfg.top_p,
                     "teacher_max_tokens": cfg.max_tokens,
-                    "teacher_input_tokens": token_counter(item.prompt),
+                    "teacher_input_policy": "full_stored_prompt",
+                    "teacher_input_tokens": generation.input_tokens,
                     "teacher_completion_tokens": generation.completion_tokens,
+                    "teacher_finish_reason": generation.finish_reason,
                     "teacher_request_seconds": round(generation.request_seconds, 6),
                     "teacher_generation_seconds": (
                         round(generation.generation_seconds, 6)
@@ -1688,7 +1615,6 @@ def _generate_records_concurrent(
             yield record
             source_queue.acknowledge(item.prompt_record_id)
             retire(item)
-            seen_text_hashes.add(text_hash)
             existing_prompt_ids.add(item.prompt_record_id)
             state["records"] = int(state["records"]) + 1
             state["estimated_tokens"] = int(state["estimated_tokens"]) + tok
@@ -1707,6 +1633,8 @@ def _generate_records_concurrent(
     finally:
         source_stop.set()
         dispatcher.join()
+        if throughput is not None:
+            throughput.pipeline_snapshot = None
         for item in list(pending.values()):
             item.future.cancel()
         executor.shutdown(wait=not reached_target and not pending, cancel_futures=True)
@@ -1730,7 +1658,6 @@ def generate_records(
     output_path: Path | None = None,
     data_fingerprint: str = "",
     token_counter: Callable[[str], int] = estimate_tokens,
-    prompt_limiter: Callable[[str, dict[str, Any]], str] = _identity_prompt_limiter,
     throughput: _ThroughputMeter | None = None,
 ) -> Iterable[TeacherSupervisedRecord]:
     if cfg.concurrency < 1:
@@ -1760,7 +1687,6 @@ def generate_records(
         output_path,
         data_fingerprint,
         token_counter,
-        prompt_limiter,
         throughput,
     )
 
@@ -1787,7 +1713,8 @@ def main() -> None:
     parser.add_argument("--input-jsonl", type=Path, default=None)
     parser.add_argument("--source-config", type=Path, default=Path("configs/dataset_sources.json"))
     parser.add_argument("--media-dir", type=Path, default=Path("data/media_cache"))
-    parser.add_argument("--max-prompt-chars", type=int, default=11000)
+    parser.add_argument("--max-prompt-chars", type=int, default=11000,
+                        help="Legacy resume-identity option; prompt/context characters are no longer clipped.")
     parser.add_argument("--sources", default="")
     parser.add_argument("--max-records-per-source", type=int, default=0)
     parser.add_argument("--max-total-records", type=int, default=0)
@@ -1828,8 +1755,7 @@ def main() -> None:
         type=int,
         default=20,
         help=(
-            "Failed prompts before a circuit-breaker cooldown. Exhausted requests "
-            "are recorded and skipped; generation continues."
+            "Deprecated compatibility option; failure streaks no longer pause the output consumer."
         ),
     )
     parser.add_argument(
@@ -1880,6 +1806,12 @@ def main() -> None:
         help="Maximum number of streamed prompts buffered in the disk spool (default: 16384).",
     )
     parser.add_argument(
+        "--outstanding-multiplier",
+        type=int,
+        default=int(os.environ.get("DG_TEACHER_OUTSTANDING_MULTIPLIER", "4")),
+        help="Bound running, queued and completed work at this multiple of concurrency (default: 4).",
+    )
+    parser.add_argument(
         "--prefetch-dir",
         type=Path,
         default=Path(os.environ.get("DG_TEACHER_PREFETCH_DIR", "data/teacher_supervised/prompt_spool")),
@@ -1889,6 +1821,7 @@ def main() -> None:
         "--student-prefix-length",
         type=int,
         default=int(os.environ.get("DG_PREFIX_LENGTH", "2048")),
+        help="Legacy resume-identity option; teacher inputs are no longer truncated to this length.",
     )
     parser.add_argument(
         "--resume-base-url",
@@ -2020,35 +1953,6 @@ def main() -> None:
     def exact_token_count(text: str) -> int:
         return len(accounting_tokenizer.encode(text, add_special_tokens=False))
 
-    def limit_prompt_to_student_context(
-        prompt: str,
-        media: dict[str, Any],
-    ) -> str:
-        has_image = bool(
-            _as_list(media.get("image")) or _as_list(media.get("images"))
-        )
-        has_audio = bool(
-            _as_list(media.get("audio")) or _as_list(media.get("audios"))
-        )
-        # Reserve multimodal soft tokens and chat-template tokens inside the
-        # same prefix budget the student receives during corruption/training.
-        reserve = 1024 if has_audio else 384 if has_image else 64
-        token_budget = args.student_prefix_length - reserve
-        if token_budget <= 0:
-            raise ValueError(
-                "student prefix length is too small for the required chat/image reserve"
-            )
-        token_ids = accounting_tokenizer.encode(
-            prompt, add_special_tokens=False
-        )
-        if len(token_ids) <= token_budget:
-            return prompt
-        return accounting_tokenizer.decode(
-            token_ids[-token_budget:],
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-
     cfg = TeacherConfig(
         runtime=args.runtime,
         model=args.model,
@@ -2065,6 +1969,7 @@ def main() -> None:
         api_key=os.environ.get(args.api_key_env, ""),
         max_consecutive_failures=args.max_consecutive_failures,
         concurrency=args.concurrency,
+        outstanding_multiplier=args.outstanding_multiplier,
         prefetch_records=args.prefetch_records,
         prefetch_dir=args.prefetch_dir,
         student_prefix_length=args.student_prefix_length,
@@ -2133,6 +2038,10 @@ def main() -> None:
                 progress_fields["total_tps"] = (
                     f"{total_tps:.1f}" if total_tps is not None else "warming"
                 )
+                progress_fields["http"] = f"{throughput.active_requests}/{cfg.concurrency}"
+                snapshot = throughput.pipeline_snapshot
+                if snapshot is not None:
+                    progress_fields.update(snapshot())
                 if args.target_estimated_tokens > 0:
                     progress_fields["eta"] = _throughput_eta(
                         args.target_estimated_tokens,
@@ -2156,7 +2065,6 @@ def main() -> None:
             args.output,
             data_fingerprint=data_fingerprint,
             token_counter=exact_token_count,
-            prompt_limiter=limit_prompt_to_student_context,
             throughput=throughput,
         ):
             _append_record_durable(args.output, record)

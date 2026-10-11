@@ -880,7 +880,7 @@ def _resolve_warmup_steps(args) -> int:
     if args.warmup_steps is not None:
         if args.warmup_steps < 0:
             raise ValueError("warmup_steps cannot be negative")
-        return min(args.warmup_steps, args.max_optimizer_steps)
+        return args.warmup_steps
     if not 0.0 <= args.warmup_ratio < 1.0:
         raise ValueError("warmup_ratio must be in [0, 1)")
     return int(round(args.max_optimizer_steps * args.warmup_ratio))

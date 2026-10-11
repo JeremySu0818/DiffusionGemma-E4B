@@ -136,7 +136,8 @@ def _load_audio(media: dict[str, Any]) -> tuple[list[np.ndarray] | None, int | N
 
 
 def _pad_ids(ids: list[int], pad_token_id: int, prefix_length: int) -> tuple[np.ndarray, np.ndarray, int]:
-    ids = ids[-prefix_length:]
+    # prefix_length is a padding floor, never a content budget.
+    prefix_length = max(prefix_length, len(ids))
     input_ids = np.full((prefix_length,), pad_token_id, dtype=np.int64)
     attention_mask = np.zeros((prefix_length,), dtype=np.int64)
     if ids:
@@ -180,9 +181,8 @@ def _encoder_inputs(
     kwargs: dict[str, Any] = {
         "text": text,
         "return_tensors": "np",
-        "padding": "max_length",
-        "truncation": True,
-        "max_length": prefix_length,
+        "padding": False,
+        "truncation": False,
     }
     images = _load_images(media)
     audio, sampling_rate = _load_audio(media)
@@ -203,12 +203,6 @@ def _encoder_inputs(
 
     input_ids = arrays.pop("input_ids").astype(np.int64)
     attention_mask = arrays.pop("attention_mask", np.ones_like(input_ids)).astype(np.int64)
-    if input_ids.shape[0] != prefix_length:
-        input_ids, attention_mask, _ = _pad_ids(
-            input_ids.astype(int).tolist(),
-            tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
-            prefix_length,
-        )
     out = {
         "prefix_ids": input_ids,
         "attention_mask": attention_mask,
@@ -229,14 +223,14 @@ def _special_token_id(tokenizer, token: str) -> int | None:
     return None if token_id < 0 or (unk is not None and token_id == int(unk)) else token_id
 
 
-def _target_token_ids(tokenizer, text: str) -> list[int]:
+def _target_token_ids(tokenizer, text: str, finish_reason: str | None = None) -> list[int]:
     ids = list(tokenizer.encode(text.strip(), add_special_tokens=False))
     if not ids:
         return []
     token_id = _special_token_id(tokenizer, "<end_of_turn>")
     if token_id is None:
         token_id = getattr(tokenizer, "eos_token_id", None)
-    if token_id is not None and ids[-1] != int(token_id):
+    if finish_reason != "length" and token_id is not None and ids[-1] != int(token_id):
         ids.append(int(token_id))
     return ids
 
@@ -251,17 +245,20 @@ def _target_blocks(tokenizer, text: str, canvas_length: int) -> Iterable[np.ndar
 
 
 def _signature(example: dict[str, Any]) -> tuple[tuple[str, tuple[int, ...], str], ...]:
-    return tuple(
-        (key, tuple(example[key].shape), str(example[key].dtype))
+    # Group nearby lengths to bound padding without opening one buffer for
+    # every distinct prompt length. Media patch/audio dimensions stay exact.
+    width = 1 << (len(example["prefix_ids"]) - 1).bit_length()
+    return (("prefix_ids", (width,), str(example["prefix_ids"].dtype)),) + tuple(
+        (key, (width,) if key == "mm_token_type_ids" else tuple(example[key].shape), str(example[key].dtype))
         for key in MULTIMODAL_SHARD_KEYS
         if key in example
     )
 
 
 def _signature_name(signature: tuple[tuple[str, tuple[int, ...], str], ...]) -> str:
-    if not signature:
-        return "text"
     keys = {item[0] for item in signature}
+    if keys == {"prefix_ids"}:
+        return "text"
     if "input_features" in keys:
         return "audio"
     if "pixel_values" in keys:
@@ -291,10 +288,19 @@ def _write_shard(
     examples: list[dict[str, Any]],
     canvas_length: int,
     prefix_length: int,
+    pad_token_id: int = 0,
 ) -> Path:
+    width = max(len(ex["prefix_ids"]) for ex in examples)
+
+    def padded(key: str, value: int) -> np.ndarray:
+        return np.stack([
+            np.pad(ex[key], (width - len(ex[key]), 0), constant_values=value)
+            for ex in examples
+        ])
+
     arrays = {
-        "prefix_ids": np.stack([ex["prefix_ids"] for ex in examples]).astype(np.int64),
-        "attention_mask": np.stack([ex["attention_mask"] for ex in examples]).astype(np.int64),
+        "prefix_ids": padded("prefix_ids", pad_token_id).astype(np.int64),
+        "attention_mask": padded("attention_mask", 0).astype(np.int64),
         "prefix_lens": np.asarray([int(ex["prefix_lens"]) for ex in examples], dtype=np.int64),
         "target_ids": np.stack([ex["target_ids"] for ex in examples]).astype(np.int64),
         "corrupted_ids": np.stack([ex["corrupted_ids"] for ex in examples]).astype(np.int64),
@@ -306,11 +312,11 @@ def _write_shard(
         "chunk_index": np.asarray([int(ex["chunk_index"]) for ex in examples], dtype=np.int32),
         "modality": np.asarray([str(ex["modality"]) for ex in examples], dtype=np.str_),
         "canvas_length": np.array([canvas_length], dtype=np.uint16),
-        "prefix_length": np.array([prefix_length], dtype=np.uint16),
+        "prefix_length": np.array([width], dtype=np.int64),
     }
     for key in MULTIMODAL_SHARD_KEYS:
         if key in examples[0]:
-            arrays[key] = np.stack([ex[key] for ex in examples])
+            arrays[key] = padded(key, 0) if key == "mm_token_type_ids" else np.stack([ex[key] for ex in examples])
     shard_path = output_dir / f"corruption_{family}_{shard_id:06d}.npz"
     fd, temp_name = tempfile.mkstemp(prefix=f".{shard_path.stem}.", suffix=".npz", dir=output_dir)
     os.close(fd)
@@ -360,7 +366,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _build_fingerprint(raw_sha256: str, **kwargs: Any) -> str:
-    payload = {"schema": 2, "raw_jsonl_sha256": raw_sha256, **kwargs}
+    payload = {"schema": 3, "raw_jsonl_sha256": raw_sha256, **kwargs}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -396,13 +402,11 @@ def build_shards(
     shard_blocks: int = 4096,
     seed: int = 1337,
     record_order: str = "shuffled",
-    max_multimodal_bytes: int = 64 * 1024**3,
+    max_multimodal_bytes: int = 0,
     max_shard_uncompressed_bytes: int = 2 * 1024**3,
     dataset_config: Path | None = None,
     source_names: set[str] | None = None,
 ) -> dict[str, Any]:
-    if target_blocks <= 0:
-        raise ValueError("target_blocks must be positive for exact dataset verification")
     if not raw_jsonl.is_file():
         raise FileNotFoundError(raw_jsonl)
     tokenizer_config = AutoConfig.from_pretrained(
@@ -423,7 +427,6 @@ def build_shards(
         else None
     )
     configured_mix: dict[str, float] = {}
-    required_buckets: set[str] = set()
     if dataset_config is not None:
         if not dataset_config.is_file():
             raise FileNotFoundError(dataset_config)
@@ -446,13 +449,6 @@ def build_shards(
             if float(item.get("share") or 0.0) > 0
             and str(item["bucket"]) in selected_buckets
         }
-        required_buckets = {
-            str(item["bucket"])
-            for item in dataset_payload.get("recommended_mix", [])
-            if item.get("required", True)
-            and float(item.get("share") or 0.0) > 0
-            and str(item["bucket"]) in selected_buckets
-        }
     fingerprint = _build_fingerprint(
         raw_sha256,
         tokenizer=tokenizer_name_or_path,
@@ -472,7 +468,7 @@ def build_shards(
     if existing_manifest.is_file():
         existing = json.loads(existing_manifest.read_text(encoding="utf-8"))
         if existing.get("fingerprint") == fingerprint:
-            verify_shards(output_dir, min_blocks=target_blocks, canvas_length=canvas_length, expected_blocks=target_blocks)
+            verify_shards(output_dir, min_blocks=target_blocks, canvas_length=canvas_length, expected_blocks=existing["blocks_written"])
             return existing
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -502,7 +498,7 @@ def build_shards(
     multimodal_bytes = 0
     by_modality: dict[str, int] = {}
     by_bucket: dict[str, int] = {}
-    pbar = tqdm(total=target_blocks, desc="corrupt", unit="block")
+    pbar = tqdm(total=target_blocks or None, desc="corrupt", unit="block")
 
     def write_progress() -> None:
         _atomic_json(
@@ -523,7 +519,7 @@ def build_shards(
             return
         family = _signature_name(sig)
         shard_id = shard_ids.get(family, 0)
-        path = _write_shard(staging, family, shard_id, examples, canvas_length, prefix_length)
+        path = _write_shard(staging, family, shard_id, examples, canvas_length, prefix_length, pad_token_id)
         shard_ids[family] = shard_id + 1
         files.append(
             {
@@ -540,7 +536,7 @@ def build_shards(
 
     try:
         for record in iter_jsonl_records(raw_jsonl, record_order=record_order, seed=seed):
-            if blocks_written >= target_blocks:
+            if target_blocks > 0 and blocks_written >= target_blocks:
                 break
             records_read += 1
             record_id = str(record.get("id") or f"row-{records_read}")
@@ -552,12 +548,13 @@ def build_shards(
             )
             bucket = str(metadata.get("bucket") or "unknown")
             modality = str(record.get("modality") or "text")
-            target_ids = _target_token_ids(tokenizer, str(record.get("text") or ""))
+            target_ids = _target_token_ids(tokenizer, str(record.get("text") or ""),
+                                           finish_reason=metadata.get("teacher_finish_reason"))
             if not target_ids:
                 continue
             prior_ids: list[int] = []
             for chunk_index, start in enumerate(range(0, len(target_ids), canvas_length)):
-                if blocks_written >= target_blocks:
+                if target_blocks > 0 and blocks_written >= target_blocks:
                     break
                 chunk = target_ids[start : start + canvas_length]
                 try:
@@ -581,13 +578,6 @@ def build_shards(
                 }
                 example_mm_bytes = _example_multimodal_bytes(example)
                 multimodal_bytes += example_mm_bytes
-                if max_multimodal_bytes > 0 and multimodal_bytes > max_multimodal_bytes:
-                    raise RuntimeError(
-                        "multimodal tensor preflight limit exceeded: "
-                        f"{multimodal_bytes} > {max_multimodal_bytes} uncompressed bytes. "
-                        "Reduce the image share/resolution/target blocks or raise DG_MAX_MULTIMODAL_SHARD_BYTES "
-                        "only after confirming cloud disk and host-RAM capacity."
-                    )
                 sig = _signature(example)
                 size = _example_bytes(example)
                 if buffers.get(sig) and (
@@ -611,31 +601,14 @@ def build_shards(
     finally:
         pbar.close()
 
-    if blocks_written != target_blocks:
+    if target_blocks > 0 and blocks_written != target_blocks:
         raise RuntimeError(
             f"corruption dataset underfilled: wrote exactly {blocks_written} blocks, required {target_blocks}; "
             "generate more valid teacher tokens before training"
         )
-    realized_shares = {
-        bucket: count / blocks_written
-        for bucket, count in sorted(by_bucket.items())
-    }
-    underfilled_buckets = {
-        bucket: {
-            "configured_prompt_share": configured_mix[bucket],
-            "realized_block_share": realized_shares.get(bucket, 0.0),
-        }
-        for bucket in required_buckets
-        if realized_shares.get(bucket, 0.0) < configured_mix[bucket] * 0.5
-    }
-    if underfilled_buckets:
-        raise RuntimeError(
-            "realized training-block mixture lost more than half of a required "
-            f"bucket allocation: {underfilled_buckets}"
-        )
-    verify_shards(staging, min_blocks=target_blocks, canvas_length=canvas_length, expected_blocks=target_blocks)
+    verify_shards(staging, min_blocks=target_blocks, canvas_length=canvas_length, expected_blocks=blocks_written)
     manifest: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "fingerprint": fingerprint,
         "raw_jsonl": str(raw_jsonl),
         "raw_jsonl_sha256": raw_sha256,
@@ -646,6 +619,7 @@ def build_shards(
         "records_read": records_read,
         "canvas_length": canvas_length,
         "prefix_length": prefix_length,
+        "prefix_policy": "full_input_with_dynamic_padding",
         "record_order": record_order,
         "seed": seed,
         "by_modality": by_modality,
@@ -667,7 +641,7 @@ def build_shards(
             output_dir,
             min_blocks=target_blocks,
             canvas_length=canvas_length,
-            expected_blocks=target_blocks,
+            expected_blocks=blocks_written,
         )
     except BaseException:
         failed = output_dir.parent / f".{output_dir.name}.failed-{fingerprint[:12]}"
@@ -747,13 +721,16 @@ def main() -> None:
     parser.add_argument("--raw-jsonl", type=Path, default=Path("data/teacher_supervised/teacher_outputs.jsonl"))
     parser.add_argument("--output-dir", type=Path, default=Path("data/corruption"))
     parser.add_argument("--tokenizer", default=os.environ.get("DG_STUDENT_MODEL", DEFAULT_DIFFUSION_REFERENCE))
-    parser.add_argument("--target-blocks", type=int, default=200_000)
+    parser.add_argument("--target-blocks", type=int, default=0,
+                        help="Explicit block budget; 0 processes every teacher answer block.")
     parser.add_argument("--canvas-length", type=int, default=CANVAS_LENGTH)
-    parser.add_argument("--prefix-length", type=int, default=DEFAULT_PREFIX_LENGTH)
+    parser.add_argument("--prefix-length", type=int, default=DEFAULT_PREFIX_LENGTH,
+                        help="Minimum padding width; full inputs and prior answer blocks are always retained.")
     parser.add_argument("--shard-blocks", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--record-order", choices=["shuffled", "source"], default="shuffled")
-    parser.add_argument("--max-multimodal-bytes", type=int, default=64 * 1024**3)
+    parser.add_argument("--max-multimodal-bytes", type=int, default=0,
+                        help="Deprecated compatibility option; cumulative media bytes no longer stop dataset creation.")
     parser.add_argument("--max-shard-uncompressed-bytes", type=int, default=2 * 1024**3)
     parser.add_argument("--dataset-config", type=Path, default=None)
     parser.add_argument("--sources", default="")

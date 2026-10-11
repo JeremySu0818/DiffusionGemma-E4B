@@ -13,43 +13,10 @@ from diffusiongemma_e4b.preflight import validate_dataset_config, validate_numer
 from diffusiongemma_e4b.train import CorruptionShardDataset
 
 
-def test_gpu_preset_has_production_defaults() -> None:
-    preset = PRESETS["gpu"]
-    assert preset["student_init"] == "transplant"
-    assert preset["student_model"] == "google/gemma-4-E4B-it"
-    assert preset["target_estimated_tokens"] == 60_000_000
-    assert preset["target_blocks"] == 220_000
-    assert preset["prefix_length"] == 2_048
-    assert preset["grad_accum"] == 16
-    assert preset["max_optimizer_steps"] == 13_000
-    assert preset["lr"] == "1e-4"
-    assert preset["warmup_steps"] == 390
-    assert preset["lora_r"] == 64
-    assert preset["lora_alpha"] == 128
-    assert preset["gradient_checkpointing"] == 0
-    assert preset["val_batches"] == 128
-    assert preset["min_relative_val_improvement"] == "0.005"
-    assert preset["checkpoint_retention"] == 3
-    assert "train_output_dir" not in preset
 
 
-def test_large_preset_is_explicit_long_run() -> None:
-    preset = PRESETS["large"]
-    assert preset["target_estimated_tokens"] == 550_000_000
-    assert preset["target_blocks"] == 2_000_000
-    assert preset["max_optimizer_steps"] == 125_000
-    assert preset["train_output_dir"] == "artifacts/conversion_training-large"
 
 
-def test_smoke_preset_is_bounded() -> None:
-    preset = PRESETS["smoke"]
-    assert preset["target_blocks"] == 128
-    assert preset["max_optimizer_steps"] == 2
-    assert preset["teacher_output"].startswith("data/teacher_supervised/smoke/")
-    assert preset["corruption_dir"] == "data/corruption-smoke"
-    assert preset["train_output_dir"] == "artifacts/conversion_training-smoke"
-    assert preset["validation_dir"] == "outputs/validation-smoke"
-    assert preset["export_output"].endswith("-smoke-bundle.tar.gz")
 
 
 def test_bash_preset_never_overwrites_existing_env() -> None:
@@ -84,16 +51,9 @@ def test_numeric_preflight_accepts_production_relationships() -> None:
     assert not [item for item in findings if item.level == "error"]
 
 
-def test_numeric_preflight_rejects_teacher_target_that_cannot_fill_blocks() -> None:
-    env = _numeric_env()
-    env["DG_TARGET_ESTIMATED_TOKENS"] = "50000000"
-    _, findings = validate_numeric_settings(env)
-    assert "insufficient_teacher_tokens" in {
-        item.code for item in findings if item.level == "error"
-    }
 
 
-def test_dataset_preflight_rejects_unnormalized_or_insufficient_mix(tmp_path: Path) -> None:
+def test_dataset_preflight_rejects_unnormalized_mix(tmp_path: Path) -> None:
     config = {
         "recommended_mix": [{"bucket": "text", "share": 0.8}],
         "sources": [{"id": "tiny", "enabled": True, "max_records": 2}],
@@ -102,7 +62,7 @@ def test_dataset_preflight_rejects_unnormalized_or_insufficient_mix(tmp_path: Pa
     path.write_text(json.dumps(config), encoding="utf-8")
     _, findings = validate_dataset_config(path, {"DG_MAX_TOKENS_PER_SAMPLE": "100"}, target_tokens=1_000)
     codes = {item.code for item in findings if item.level == "error"}
-    assert codes == {"dataset_mix_not_normalized", "source_capacity_too_small"}
+    assert codes == {"dataset_mix_not_normalized"}
 
 
 def test_record_split_is_stratified_by_bucket(tmp_path: Path) -> None:

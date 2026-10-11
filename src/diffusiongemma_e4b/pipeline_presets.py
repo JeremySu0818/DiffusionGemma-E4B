@@ -14,7 +14,7 @@ PRESETS: dict[str, dict[str, object]] = {
         # One full pass over E4B teacher canvases. The custom student preserves
         # E4B weights and adapts only diffusion-decoder behavior.
         "target_estimated_tokens": 60_000_000,
-        "target_blocks": 220_000,
+        "target_blocks": 0,
         "prefix_length": 2_048,
         "batch_size": 1,
         "grad_accum": 16,
@@ -40,7 +40,7 @@ PRESETS: dict[str, dict[str, object]] = {
         "student_init": "transplant",
         "student_model": "google/gemma-4-E4B-it",
         "target_estimated_tokens": 550_000_000,
-        "target_blocks": 2_000_000,
+        "target_blocks": 0,
         "prefix_length": 2_048,
         "batch_size": 1,
         "grad_accum": 32,

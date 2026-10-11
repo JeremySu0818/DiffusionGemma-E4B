@@ -177,15 +177,13 @@ def _extract_context(row: dict[str, Any]) -> str:
         return context
     messages = _messages_from_row(row)
     user_turns = [_message_text(msg) for msg in messages if _message_role(msg) in {"user", "human", "prompter", "client"}]
-    return "\n\n".join(turn for turn in user_turns[:3] if turn)
+    return "\n\n".join(turn for turn in user_turns if turn)
 
 
 def _clean_text(text: str, max_chars: int) -> str:
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) <= max_chars:
-        return text
-    clipped = text[:max_chars]
-    return (clipped.rsplit(" ", 1)[0] or clipped).strip()
+    # Keep the legacy argument for callers and resume identity, but never
+    # silently remove prompt/context content before teacher generation.
+    return text.strip()
 
 
 def _strip_media_placeholders(text: str) -> str:
@@ -324,8 +322,8 @@ def _prompt_record(source: dict[str, Any], row: dict[str, Any], max_chars: int, 
     choices = row.get("choices")
     if isinstance(choices, list) and choices:
         option_lines = [
-            f"{chr(65 + index)}. {_as_text(choice)}"
-            for index, choice in enumerate(choices[:26])
+            f"{chr(65 + index) if index < 26 else index + 1}. {_as_text(choice)}"
+            for index, choice in enumerate(choices)
             if _as_text(choice)
         ]
         if option_lines:
@@ -356,16 +354,6 @@ def _prompt_record(source: dict[str, Any], row: dict[str, Any], max_chars: int, 
         )
     if not prompt and not context:
         return None
-
-    # max_chars is a teacher-request budget, not a per-field budget. Without
-    # this final combined clamp a long context plus a long question could be
-    # almost 2x the advertised limit and repeatedly exceed vLLM max_model_len.
-    prompt = _clean_text(prompt, max_chars)
-    if context and prompt and context != prompt:
-        context_budget = max(0, max_chars - len(prompt) - 32)
-        context = _clean_text(context, context_budget)
-    else:
-        context = _clean_text(context, max_chars)
 
     row_key = _source_row_key(source, row, prompt, context)
     media = _collect_media(source, row, media_dir, row_key)
@@ -426,7 +414,7 @@ def _stream_parquet_tables(builder: Any, files: Any, row_groups_list: Any = None
                 )
                 try:
                     for batch_index, batch in enumerate(reader.iter_batches(
-                        batch_size=32, row_groups=row_groups,
+                        batch_size=builder.config.batch_size, row_groups=row_groups,
                         columns=builder.config.columns,
                     )):
                         table = arrow.Table.from_batches([batch])
@@ -465,7 +453,7 @@ def _open_hf_dataset(source: dict[str, Any]) -> Any:
     if isinstance(builder.config, ParquetConfig):
         import pyarrow.dataset as arrow_dataset
 
-        builder.config.batch_size = min(builder.config.batch_size or 32, 32)
+        builder.config.batch_size = int(os.environ.get("DG_STREAM_PARQUET_BATCH_SIZE", "32"))
         builder.config.fragment_scan_options = arrow_dataset.ParquetFragmentScanOptions(
             pre_buffer=False, use_buffered_stream=True, buffer_size=64 * 1024,
         )
@@ -791,12 +779,6 @@ def _load_manifest_iter(source: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 yield json.loads(line)
 
 
-def _bounded_limit(source: dict[str, Any], cli_limit: int) -> int:
-    configured = int(source.get("max_records") or 0)
-    positive = [value for value in (configured, int(cli_limit or 0)) if value > 0]
-    return min(positive) if positive else 0
-
-
 def _training_weights(config: dict[str, Any], sources: list[dict[str, Any]]) -> tuple[list[str], dict[str, float], set[str]]:
     enabled_buckets = {
         str(source.get("bucket") or ("image" if "image" in str(source.get("modality")) else "text"))
@@ -1004,21 +986,12 @@ def iter_prompt_records(
                 and bool(source.get("streaming", True))
                 and not source.get("manifest_only")
             ):
-                # Decoded image/audio rows can be large, so keep only a couple
-                # in memory while allowing lightweight text sources to read far
-                # enough ahead to hide shard-open and network latency.
-                modality = str(source.get("modality") or "text")
-                per_source_records = (
-                    min(source_prefetch_records, 2)
-                    if modality in {"image", "audio"}
-                    else source_prefetch_records
-                )
                 row_iterator = _BackgroundPrefetchIterator(
                     _prepare_source_rows(row_iterator, source, max_chars, media_dir),
-                    max_records=max(1, per_source_records),
+                    max_records=source_prefetch_records,
                     name=str(source.get("name") or source["id"]),
                 )
-            state = _SourceState(source, row_iterator, _bounded_limit(source, max_records_per_source))
+            state = _SourceState(source, row_iterator, max_records_per_source)
             by_bucket[bucket].append(state)
             all_states.append(state)
         except Exception as exc:  # noqa: BLE001

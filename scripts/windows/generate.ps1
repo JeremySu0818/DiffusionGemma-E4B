@@ -39,6 +39,7 @@ $maxConsecutiveFailures = if ($env:DG_TEACHER_MAX_CONSECUTIVE_FAILURES) { $env:D
 $teacherOutput = if ($env:DG_TEACHER_OUTPUT) { $env:DG_TEACHER_OUTPUT } else { "data/teacher_supervised/teacher_outputs.jsonl" }
 $teacherProgress = if ($env:DG_TEACHER_PROGRESS) { $env:DG_TEACHER_PROGRESS } else { "data/teacher_supervised/progress.json" }
 $concurrency = if ($env:DG_TEACHER_CONCURRENCY) { $env:DG_TEACHER_CONCURRENCY } else { "10" }
+$outstandingMultiplier = if ($env:DG_TEACHER_OUTSTANDING_MULTIPLIER) { $env:DG_TEACHER_OUTSTANDING_MULTIPLIER } else { "4" }
 $prefetchRecords = if ($env:DG_TEACHER_PREFETCH_RECORDS) { $env:DG_TEACHER_PREFETCH_RECORDS } else { "16384" }
 $prefetchDir = if ($env:DG_TEACHER_PREFETCH_DIR) { $env:DG_TEACHER_PREFETCH_DIR } else { "data/teacher_supervised/prompt_spool" }
 $prefixLength = if ($env:DG_PREFIX_LENGTH) { $env:DG_PREFIX_LENGTH } else { "2048" }
@@ -67,6 +68,7 @@ python -m diffusiongemma_e4b.teacher `
   --tokenizer $tokenizer `
   --max-consecutive-failures $maxConsecutiveFailures `
   --concurrency $concurrency `
+  --outstanding-multiplier $outstandingMultiplier `
   --prefetch-records $prefetchRecords `
   --prefetch-dir $prefetchDir `
   --student-prefix-length $prefixLength `

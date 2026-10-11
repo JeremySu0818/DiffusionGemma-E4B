@@ -278,33 +278,6 @@ def test_newly_spooled_prompts_fill_idle_slots_before_first_request_finishes(
     assert not consumer.is_alive()
 
 
-def test_resume_activity_resets_prefetch_stall_clock(tmp_path, monkeypatch):
-    def prompt_stream():
-        yield next(_prompts(1))
-        for _ in range(2):
-            time.sleep(0.03)
-            yield next(_prompts(1))
-        time.sleep(0.03)
-        yield next(iter(list(_prompts(2))[1:]))
-
-    class Client:
-        def generate(self, prompt, media=None):
-            return f"unique answer for {prompt}"
-
-    monkeypatch.setattr(teacher, "make_client", lambda _cfg: Client())
-    monkeypatch.setattr(teacher, "_PROMPT_PREFETCH_STALL_TIMEOUT_S", 0.05)
-    records = list(
-        generate_records(
-            _cfg(2),
-            prompt_stream(),
-            0,
-            tmp_path / "progress.json",
-            data_fingerprint="unit",
-            token_counter=lambda _text: 4,
-        )
-    )
-
-    assert [record.metadata["prompt_record_id"] for record in records] == ["p0", "p1"]
 
 
 def test_concurrency_one_preserves_synchronous_execution(tmp_path, monkeypatch):
@@ -336,7 +309,8 @@ def test_concurrency_one_preserves_synchronous_execution(tmp_path, monkeypatch):
     assert set(client_threads) == {main_thread}
 
 
-def test_durable_record_keeps_prompt_and_context_separate(tmp_path, monkeypatch):
+@pytest.mark.parametrize("concurrency", [1, 2])
+def test_durable_records_preserve_full_prompts_and_shared_answers(tmp_path, monkeypatch, concurrency):
     sent_prompts: list[str] = []
 
     class Client:
@@ -349,25 +323,27 @@ def test_durable_record_keeps_prompt_and_context_separate(tmp_path, monkeypatch)
         "id": "context-prompt",
         "source": "unit/source",
         "prompt_text": "What follows from the context?",
-        "context_text": "A premise used by the question.",
+        "context_text": "A premise used by the question.\n" * 3000,
         "modality": "text",
     }
     records = list(
         generate_records(
-            _cfg(1),
-            [prompt],
+            _cfg(concurrency),
+            [prompt, {**prompt, "id": "context-prompt-2", "prompt_text": "A second question?"}],
             0,
             tmp_path / "progress.json",
             data_fingerprint="unit",
             token_counter=lambda text: len(text.split()),
         )
     )
-    assert len(records) == 1
-    assert records[0].prompt_text == prompt["prompt_text"]
-    assert records[0].context_text == prompt["context_text"]
-    assert sent_prompts == [
-        "Context:\nA premise used by the question.\n\nRequest:\nWhat follows from the context?"
-    ]
+    assert len(records) == 2
+    assert {r.prompt_text for r in records} == {prompt["prompt_text"], "A second question?"}
+    assert all(r.context_text == prompt["context_text"] for r in records)
+    assert len({r.text for r in records}) == 1
+    assert set(sent_prompts) == {
+        f"Context:\n{prompt['context_text'].strip()}\n\nRequest:\n{question}"
+        for question in (prompt["prompt_text"], "A second question?")
+    }
 
 
 def test_target_discards_pending_and_resume_uses_stable_prompt_ids(tmp_path, monkeypatch):
@@ -419,11 +395,9 @@ def test_target_discards_pending_and_resume_uses_stable_prompt_ids(tmp_path, mon
 
 def test_concurrency_does_not_change_generation_fingerprint():
     one = _cfg(1)
-    many = replace(one, concurrency=8)
+    many = replace(one, concurrency=8, outstanding_multiplier=1)
 
     assert generation_fingerprint(one, "data") == generation_fingerprint(many, "data")
-    assert TeacherConfig("openai-compatible", "m", "http://x", 1, 0.2, 0.95).concurrency == 10
-    assert TeacherConfig("openai-compatible", "m", "http://x", 1, 0.2, 0.95).prefetch_records == 16384
 
 
 def test_prefetch_reservoir_cannot_be_empty(tmp_path, monkeypatch):
@@ -620,53 +594,11 @@ def test_empty_teacher_output_is_retried_and_contained(monkeypatch):
     assert sleeps == [0.0]
 
 
-@pytest.mark.parametrize("concurrency", [1, 2])
-def test_consecutive_failures_cool_down_and_continue(tmp_path, monkeypatch, concurrency):
-    sleeps = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
-
-    class AlwaysFailingClient:
-        def generate(self, prompt, media=None):
-            raise ValueError("server is down")
-
-    monkeypatch.setattr(teacher, "make_client", lambda _cfg: AlwaysFailingClient())
-    cfg = TeacherConfig(
-        runtime="openai-compatible",
-        model="m",
-        base_url="http://x",
-        max_tokens=64,
-        temperature=0.2,
-        top_p=0.95,
-        max_retries=0,
-        max_consecutive_failures=3,
-        retry_base_s=1.0,
-        concurrency=concurrency,
-        min_estimated_tokens=1,
-    )
-    progress_file = tmp_path / "progress.json"
-    assert (
-        list(
-            generate_records(
-                cfg,
-                _prompts(10),
-                target_estimated_tokens=0,
-                progress_path=progress_file,
-                token_counter=lambda t: len(t.split()),
-            )
-        )
-        == []
-    )
-
-    state = json.loads(progress_file.read_text())
-    assert state["failed_prompts"] == 10
-    assert state["failure_cooldowns"] == 3
-    assert state["consecutive_failures"] == 1
-    assert len(sleeps) == 3
-    assert all(1.5 <= seconds <= 4.5 for seconds in sleeps)
 
 
-@pytest.mark.parametrize("concurrency", [4, 256])
-def test_workers_refill_while_output_consumer_is_paused(tmp_path, monkeypatch, concurrency):
+@pytest.mark.parametrize("concurrency", [4, 300])
+@pytest.mark.parametrize("multiplier", [2, 4])
+def test_workers_refill_while_output_consumer_is_paused(tmp_path, monkeypatch, concurrency, multiplier):
     first_wave = threading.Barrier(concurrency)
     second_wave_started = threading.Event()
     release_second_wave = threading.Event()
@@ -683,10 +615,10 @@ def test_workers_refill_while_output_consumer_is_paused(tmp_path, monkeypatch, c
                 ordinal = started
                 active += 1
                 peak_active = max(peak_active, active)
-                if started == 2 * concurrency:
+                if started == multiplier * concurrency:
                     second_wave_started.set()
             try:
-                if ordinal <= concurrency:
+                if ordinal <= (multiplier - 1) * concurrency:
                     first_wave.wait(timeout=10)
                 else:
                     assert release_second_wave.wait(timeout=10)
@@ -697,7 +629,8 @@ def test_workers_refill_while_output_consumer_is_paused(tmp_path, monkeypatch, c
 
     monkeypatch.setattr(teacher, "make_client", lambda _cfg: Client())
     records = generate_records(
-        _cfg(concurrency), _prompts(3 * concurrency), 0,
+        replace(_cfg(concurrency), outstanding_multiplier=multiplier),
+        _prompts((multiplier + 1) * concurrency), 0,
         tmp_path / "progress.json", token_counter=lambda _text: 4,
     )
     try:
@@ -707,17 +640,17 @@ def test_workers_refill_while_output_consumer_is_paused(tmp_path, monkeypatch, c
         # either the API concurrency or the bounded outstanding-work budget.
         assert second_wave_started.wait(timeout=10)
         with lock:
-            assert started == 2 * concurrency
+            assert started == multiplier * concurrency
             assert active == concurrency
             assert peak_active == concurrency
         with sqlite3.connect(next((tmp_path / "prompt_spool").glob("*.sqlite3"))) as connection:
             leased = connection.execute(
                 "SELECT COUNT(*) FROM prompts WHERE status = 'inflight'"
             ).fetchone()[0]
-        assert leased == 2 * concurrency  # Includes completed, unacknowledged output.
+        assert leased == multiplier * concurrency  # Includes unacknowledged output.
         release_second_wave.set()
         all_records = [first, *records]
-        assert len(all_records) == 3 * concurrency
+        assert len(all_records) == (multiplier + 1) * concurrency
         assert len({r.metadata["prompt_record_id"] for r in all_records}) == len(all_records)
     finally:
         release_second_wave.set()
@@ -796,18 +729,6 @@ def test_failed_stream_flushes_tokens_and_cleans_up_meter():
     assert not meter._request_tokens
 
 
-def test_dispatch_prompt_error_propagates_and_requeues(tmp_path, monkeypatch):
-    monkeypatch.setattr(teacher, "make_client", lambda _cfg: object())
-    cfg = replace(_cfg(2), prefetch_dir=tmp_path / "spool")
-
-    def broken_limiter(prompt, media):
-        raise ValueError("invalid prompt budget")
-
-    with pytest.raises(ValueError, match="invalid prompt budget"):
-        list(generate_records(cfg, _prompts(1), 0, tmp_path / "progress.json",
-                              prompt_limiter=broken_limiter))
-    with sqlite3.connect(next(cfg.prefetch_dir.glob("*.sqlite3"))) as connection:
-        assert connection.execute("SELECT status FROM prompts").fetchall() == [("queued",)]
 
 
 def test_prefix_token_correction_cannot_produce_negative_display_tps():

@@ -5,6 +5,7 @@ from transformers.models.diffusion_gemma.configuration_diffusion_gemma import Di
 
 from diffusiongemma_e4b.config import build_diffusion_e4b_config
 from diffusiongemma_e4b.train import CorruptionShardDataset, compute_loss
+from diffusiongemma_e4b.corruption import _encoder_inputs, _write_shard
 
 
 def test_e4b_production_config_preserves_multimodal_and_text_topology(tmp_path):
@@ -91,3 +92,49 @@ def test_corruption_dataset_reads_multimodal_npz_fields(tmp_path):
     assert "pixel_values" in item
     assert "image_position_ids" in item
     assert item["pixel_values"].shape == (3, 8, 8)
+
+
+def test_multimodal_shard_keeps_full_inputs_and_aligns_padding(tmp_path, monkeypatch):
+    import numpy as np
+    from diffusiongemma_e4b import corruption
+
+    class Processor:
+        def apply_chat_template(self, *args, **kwargs):
+            return "complete multimodal prompt"
+
+        def __call__(self, **kwargs):
+            assert kwargs["truncation"] is False
+            assert kwargs["padding"] is False
+            assert "max_length" not in kwargs
+            width = kwargs["images"]
+            return {
+                "input_ids": np.arange(10, 10 + width)[None],
+                "attention_mask": np.ones((1, width), dtype=np.int64),
+                "mm_token_type_ids": np.ones((1, width), dtype=np.int64),
+                "pixel_values": np.zeros((1, 3, 8, 8)),
+                "image_position_ids": np.zeros((1, 2, 2), dtype=np.int64),
+            }
+
+    monkeypatch.setattr(corruption, "_load_images", lambda media: media["images"])
+    examples = []
+    for width in (100, 120):
+        encoder = _encoder_inputs(Processor(), None, {"prompt_text": "question", "media": {"images": [width]}}, 16)
+        examples.append({
+            **encoder,
+            "target_ids": np.ones(4, dtype=np.int64),
+            "corrupted_ids": np.ones(4, dtype=np.int64),
+            "corruption_masks": np.ones(4, dtype=bool),
+            "noise_t": 0.5,
+            "record_id": f"r{width}", "source_id": "images", "bucket": "images",
+            "chunk_index": 0, "modality": "image",
+        })
+    path = _write_shard(tmp_path, "image", 0, examples, 4, 16, pad_token_id=7)
+    with np.load(path, allow_pickle=False) as shard:
+        assert shard["prefix_lens"].tolist() == [100, 120]
+        for row, width in enumerate((100, 120)):
+            valid = shard["attention_mask"][row].astype(bool)
+            assert shard["prefix_ids"][row][valid].tolist() == list(range(10, 10 + width))
+            assert shard["mm_token_type_ids"][row][valid].tolist() == [1] * width
+            assert shard["prefix_ids"][row][~valid].tolist() == [7] * (120 - width)
+            assert not shard["mm_token_type_ids"][row][~valid].any()
+        assert shard["image_position_ids"].shape == (2, 2, 2)

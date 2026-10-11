@@ -61,7 +61,7 @@ def test_prefetch_prepares_prompt_without_retaining_raw_payload(tmp_path):
     prepared = _prepare_source_rows(Rows(), {"id": "unit/text"}, 100, tmp_path)
     try:
         item = next(prepared)
-        assert len(item.record["prompt_text"]) == 100
+        assert item.record["prompt_text"] == "p" * 1000
         assert "unused_payload" not in item.record
         assert refs[0]() is None
     finally:
@@ -95,7 +95,7 @@ def test_image_only_placeholder_gets_meaningful_teacher_prompt(tmp_path: Path) -
     assert record["media"]["images"] == ["source-image.png"]
 
 
-def test_prompt_and_context_share_one_teacher_request_budget() -> None:
+def test_prompt_and_context_are_preserved_despite_legacy_character_budget() -> None:
     source = {
         "id": "unit/context",
         "name": "unit_context",
@@ -105,15 +105,13 @@ def test_prompt_and_context_share_one_teacher_request_budget() -> None:
     }
     row = {
         "id": "context-1",
-        "question": "Q" * 400,
-        "context": "C" * 900,
+        "question": "Explain this code: " + "Q" * 400,
+        "context": "def solve():\n    if True:\n        return 42\n" + "C" * 900,
     }
     record = _prompt_record(source, row, max_chars=1_000)
     assert record is not None
-    assert (
-        len(record["prompt_text"]) + len(record["context_text"]) + 32
-        <= 1_000
-    )
+    assert record["prompt_text"] == row["question"]
+    assert record["context_text"] == row["context"]
 
 
 def test_image_source_requires_real_image_and_keeps_choices_not_answer(

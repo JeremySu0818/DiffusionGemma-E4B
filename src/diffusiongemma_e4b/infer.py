@@ -24,7 +24,7 @@ MULTIMODAL_BATCH_KEYS = (
 
 
 def entropy_from_logits(logits: torch.Tensor, temperature: float) -> tuple[torch.Tensor, torch.Tensor]:
-    scaled = logits.float() / max(float(temperature), 1e-6)
+    scaled = logits.float() / float(temperature)
     probs = torch.softmax(scaled, dim=-1)
     log_probs = torch.log_softmax(scaled, dim=-1)
     entropy = -(probs * log_probs).sum(dim=-1)
@@ -47,7 +47,6 @@ def _joint_entropy_accept_mask(entropy: torch.Tensor, entropy_bound: float) -> t
         sorted_entropy, sorted_index = torch.sort(entropy[batch_idx])
         admissible = torch.cumsum(sorted_entropy, dim=0) - sorted_entropy <= float(entropy_bound)
         count = int(admissible.long().sum().item())
-        count = max(1, min(count, entropy.shape[1]))
         accept[batch_idx, sorted_index[:count]] = True
     return accept
 

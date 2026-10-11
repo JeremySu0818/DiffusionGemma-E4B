@@ -11,7 +11,7 @@ python -m diffusiongemma_e4b.corruption \
   --raw-jsonl "${DG_TEACHER_OUTPUT:-data/teacher_supervised/teacher_outputs.jsonl}" \
   --output-dir "${DG_CORRUPTION_DIR:-data/corruption}" \
   --tokenizer "${DG_STUDENT_MODEL:-google/gemma-4-E4B-it}" \
-  --target-blocks "${DG_TARGET_BLOCKS:-200000}" \
+  --target-blocks "${DG_TARGET_BLOCKS:-0}" \
   --canvas-length "${DG_CANVAS_LENGTH:-256}" \
   --prefix-length "${DG_PREFIX_LENGTH:-512}" \
   --shard-blocks "${DG_SHARD_BLOCKS:-4096}" \

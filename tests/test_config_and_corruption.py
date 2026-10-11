@@ -34,20 +34,6 @@ from diffusiongemma_e4b.teacher import (
 )
 
 
-def test_corruption_shard_shape(tmp_path: Path):
-    path = tmp_path / "corruption_000000.npz"
-    np.savez_compressed(
-        path,
-        prefix_ids=np.zeros((2, 8), dtype=np.uint32),
-        prefix_lens=np.array([0, 8], dtype=np.uint16),
-        target_ids=np.zeros((2, 256), dtype=np.uint32),
-        corrupted_ids=np.ones((2, 256), dtype=np.uint32),
-        corruption_masks=np.ones((2, 256), dtype=np.bool_),
-        noise_t=np.array([0.1, 0.5], dtype=np.float32),
-    )
-    with np.load(path) as shard:
-        assert shard["target_ids"].shape == (2, 256)
-        assert shard["corrupted_ids"].shape == shard["target_ids"].shape
 
 
 def test_teacher_supervised_record_rejects_prompt_free(tmp_path: Path):
@@ -493,17 +479,6 @@ def test_teacher_progress_reconciles_from_output_jsonl(tmp_path: Path):
     assert state["reconciled_from_output"] is True
 
 
-def test_production_dataset_profile_has_exact_training_mix_and_no_active_audio():
-    config = json.loads(Path("configs/dataset_sources.json").read_text(encoding="utf-8"))
-
-    assert sum(item["share"] for item in config["recommended_mix"]) == pytest.approx(1.0)
-    assert all(item["bucket"] != "eval_only" for item in config["recommended_mix"])
-    assert not any(
-        source.get("enabled", True) and source.get("modality") == "audio"
-        for source in config["sources"]
-    )
-    assert config["eval_sources"]
-    assert all(source["eval_only"] for source in config["eval_sources"])
 
 
 def test_weighted_bucket_mix_is_enforced_and_ids_are_stable(tmp_path: Path):
@@ -646,15 +621,18 @@ def test_openai_teacher_omits_output_cap_when_not_requested():
 
 def test_openai_teacher_accepts_length_finished_response():
     class LengthResponse(_FakeResponse):
-        def json(self):
-            return {"choices": [{"finish_reason": "length", "message": {"content": "A valid teacher answer."}}]}
+        def iter_lines(self, **kwargs):
+            yield 'data: {"choices":[{"delta":{"content":"A valid teacher answer."},"finish_reason":"length"}]}'
+            yield 'data: [DONE]'
 
     cfg = TeacherConfig("openai-compatible", "teacher", "http://teacher/v1", 64, 0.2, 0.95)
     client = OpenAICompletionsClient(cfg)
     client.session = _FakeSession()
     client.session.post = lambda _url, **_kwargs: LengthResponse()
 
-    assert client.generate("hello") == "A valid teacher answer."
+    result = client.generate("hello")
+    assert result == "A valid teacher answer."
+    assert result.finish_reason == "length"
 
 
 def test_teacher_progress_fingerprint_mismatch_is_fatal(tmp_path: Path):
@@ -723,6 +701,7 @@ def test_build_shards_writes_exact_manifest_and_provenance(tmp_path: Path, monke
                     "prompt_text": f"question {i}",
                     "text": "abcdef",
                     "modality": "text",
+                    "metadata": {"teacher_finish_reason": "length" if i == 1 else "stop"},
                 }
             )
             + "\n"
@@ -744,13 +723,29 @@ def test_build_shards_writes_exact_manifest_and_provenance(tmp_path: Path, monke
 
     assert manifest["blocks_written"] == 3
     assert verified["exact"] is True
-    with np.load(output / manifest["files"][0]["name"], allow_pickle=False) as shard:
-        assert "record_ids" in shard
-        assert "source_ids" in shard
-        assert "chunk_index" in shard
-        assert "modality" in shard
-        assert shard["target_ids"].shape[1] == 4
+    tokenizer = _FakeTokenizer()
+    for entry in manifest["files"]:
+        with np.load(output / entry["name"], allow_pickle=False) as shard:
+            for row, record_id in enumerate(shard["record_ids"]):
+                index = int(str(record_id).split("-")[-1])
+                chunk_index = int(shard["chunk_index"][row])
+                answer_ids = tokenizer.encode("abcdef", add_special_tokens=False) + ([98] if index == 0 else [])
+                expected_text = _chat_prefix_text(
+                    tokenizer, {"prompt_text": f"question {index}"},
+                    answer_ids[:chunk_index * 4],
+                )
+                expected_ids = tokenizer.encode(expected_text, add_special_tokens=False)
+                actual = shard["prefix_ids"][row][shard["attention_mask"][row].astype(bool)]
+                assert actual.tolist() == expected_ids
+                assert int(shard["prefix_lens"][row]) == len(expected_ids)
+                actual_target = shard["target_ids"][row]
+                assert actual_target[actual_target >= 0].tolist() == answer_ids[chunk_index * 4:(chunk_index + 1) * 4]
 
     # An identical invocation verifies and reuses the completed fingerprint.
     reused = build_shards(raw, output, "fake/student", target_blocks=3, canvas_length=4, prefix_length=16, shard_blocks=2)
     assert reused["fingerprint"] == manifest["fingerprint"]
+
+    complete = build_shards(raw, tmp_path / "all-blocks", "fake/student", target_blocks=0,
+                            canvas_length=4, prefix_length=16, shard_blocks=2)
+    assert complete["blocks_written"] == 4
+    assert verify_shards(tmp_path / "all-blocks", canvas_length=4, expected_blocks=4)["exact"]

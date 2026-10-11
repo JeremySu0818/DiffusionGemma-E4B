@@ -22,9 +22,7 @@ MODEL="${DG_MODEL:-google/gemma-4-E4B-it}"
 SERVED_MODEL_NAME="${DG_TEACHER_SERVED_MODEL_NAME:-$MODEL}"
 HOST="${DG_TEACHER_HOST:-127.0.0.1}"
 PORT="${DG_TEACHER_PORT:-8000}"
-GPU_MEMORY_UTILIZATION="${DG_TEACHER_GPU_MEMORY_UTILIZATION:-0.80}"
 TENSOR_PARALLEL_SIZE="${DG_TEACHER_TENSOR_PARALLEL_SIZE:-1}"
-MAX_MODEL_LEN="${DG_TEACHER_MAX_MODEL_LEN:-16384}"
 DTYPE="${DG_DTYPE:-bfloat16}"
 
 if ! python - <<'PY'
@@ -38,6 +36,15 @@ then
 fi
 
 extra_args=()
+if [[ -n "${DG_TEACHER_GPU_MEMORY_UTILIZATION:-}" ]]; then
+  extra_args+=(--gpu-memory-utilization "$DG_TEACHER_GPU_MEMORY_UTILIZATION")
+fi
+if [[ -n "${DG_TEACHER_MAX_MODEL_LEN:-}" ]]; then
+  extra_args+=(--max-model-len "$DG_TEACHER_MAX_MODEL_LEN")
+fi
+if [[ -n "${DG_TEACHER_MAX_NUM_SEQS:-}" ]]; then
+  extra_args+=(--max-num-seqs "$DG_TEACHER_MAX_NUM_SEQS")
+fi
 if [[ "${DG_TEACHER_ENFORCE_EAGER:-0}" == "1" ]]; then
   extra_args+=(--enforce-eager)
 fi
@@ -51,8 +58,6 @@ exec python -m vllm.entrypoints.openai.api_server \
   --host "$HOST" \
   --port "$PORT" \
   --dtype "$DTYPE" \
-  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
   --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
-  --max-model-len "$MAX_MODEL_LEN" \
   --trust-remote-code \
   "${extra_args[@]}"

@@ -21,6 +21,7 @@ from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
 from transformers.models.gemma4.modeling_gemma4 import (
     ALL_ATTENTION_FUNCTIONS,
     Gemma4RMSNorm,
+    Gemma4PreTrainedModel,
     Gemma4TextAttention,
     Gemma4TextDecoderLayer,
     Gemma4TextModel,
@@ -360,7 +361,7 @@ class E4BDiffusionDecoderTextLayer(Gemma4TextDecoderLayer):
         self.self_attn = E4BDiffusionDecoderTextAttention(config, layer_idx)
 
 
-class E4BDiffusionDecoderModel(DiffusionGemmaPreTrainedModel):
+class E4BDiffusionDecoderModel(DiffusionGemmaPreTrainedModel, Gemma4PreTrainedModel):
     """Bidirectional diffusion canvas decoder with E4B-shape-compatible weights."""
 
     create_diffusion_decoder_attention_mask = staticmethod(

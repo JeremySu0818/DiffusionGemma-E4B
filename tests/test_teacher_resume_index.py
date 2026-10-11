@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -40,8 +39,8 @@ def test_restart_reuses_index_and_only_decodes_appended_records(tmp_path, monkey
 
     monkeypatch.setattr(teacher.json, "loads", loads)
     assert teacher.progress_from_output(path)["estimated_tokens"] == 1000
-    ids, hashes = teacher._existing_output_sets(path)
-    assert len(ids) == len(hashes) == 100
+    ids = teacher._existing_prompt_ids(path)
+    assert len(ids) == 100
     assert not decoded_rows
     _write(path, [_row(100)], mode="a")
     state = teacher.progress_from_output(path)
@@ -50,9 +49,8 @@ def test_restart_reuses_index_and_only_decodes_appended_records(tmp_path, monkey
     assert state["estimated_tokens_by_bucket"] == {"code": 1010}
     assert state["last_record_id"] == "r100"
     assert decoded_rows == [_row(100)]
-    ids, hashes = teacher._existing_output_sets(path)
+    ids = teacher._existing_prompt_ids(path)
     assert "p100" in ids
-    assert hashlib.sha256(b"answer 100").hexdigest() in hashes
     assert len(decoded_rows) == 1
 
 
@@ -72,7 +70,7 @@ def test_changed_output_rebuilds_index(tmp_path, change):
         _write(path, rows)
     state = teacher.progress_from_output(path)
     assert state["records"] == len(rows)
-    ids, _ = teacher._existing_output_sets(path)
+    ids = teacher._existing_prompt_ids(path)
     assert ids == {row["metadata"]["prompt_record_id"] for row in rows}
 
 
@@ -104,4 +102,4 @@ def test_corrupt_cache_falls_back_to_durable_output(tmp_path):
     _write(path, [_row(0)])
     path.with_name(path.name + ".resume.sqlite3").write_bytes(b"broken cache")
     assert teacher.progress_from_output(path)["records"] == 1
-    assert teacher._existing_output_sets(path)[0] == {"p0"}
+    assert teacher._existing_prompt_ids(path) == {"p0"}

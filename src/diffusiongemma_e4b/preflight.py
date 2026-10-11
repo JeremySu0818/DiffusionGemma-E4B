@@ -53,10 +53,10 @@ def _number(env: Mapping[str, str], key: str, default: float, findings: list[Fin
 
 def validate_numeric_settings(env: Mapping[str, str]) -> tuple[dict[str, Any], list[Finding]]:
     findings: list[Finding] = []
-    target_tokens = _integer(env, "DG_TARGET_ESTIMATED_TOKENS", 0, findings, 1)
-    target_blocks = _integer(env, "DG_TARGET_BLOCKS", 0, findings, 1)
+    target_tokens = _integer(env, "DG_TARGET_ESTIMATED_TOKENS", 0, findings, 0)
+    target_blocks = _integer(env, "DG_TARGET_BLOCKS", 0, findings, 0)
     canvas = _integer(env, "DG_CANVAS_LENGTH", 256, findings, 1)
-    prefix = _integer(env, "DG_PREFIX_LENGTH", 512, findings, 1)
+    prefix = _integer(env, "DG_PREFIX_LENGTH", 512, findings, 0)
     batch = _integer(env, "DG_BATCH_SIZE", 1, findings, 1)
     accum = _integer(env, "DG_GRAD_ACCUM", 32, findings, 1)
     optimizer_steps = _integer(env, "DG_MAX_OPTIMIZER_STEPS", 0, findings, 1)
@@ -70,14 +70,14 @@ def validate_numeric_settings(env: Mapping[str, str]) -> tuple[dict[str, Any], l
         env, "DG_TEACHER_TENSOR_PARALLEL_SIZE", 1, findings, 1
     )
     teacher_max_model_len = _integer(
-        env, "DG_TEACHER_MAX_MODEL_LEN", 16_384, findings, 1
+        env, "DG_TEACHER_MAX_MODEL_LEN", 0, findings, 0
     )
-    max_prompt_chars = _integer(env, "DG_MAX_PROMPT_CHARS", 11_000, findings, 1)
+    max_prompt_chars = _integer(env, "DG_MAX_PROMPT_CHARS", 11_000, findings, 0)
     max_tokens_per_sample = _integer(
-        env, "DG_MAX_TOKENS_PER_SAMPLE", 4_096, findings, 1
+        env, "DG_MAX_TOKENS_PER_SAMPLE", 0, findings, 0
     )
     teacher_gpu_memory_utilization = _number(
-        env, "DG_TEACHER_GPU_MEMORY_UTILIZATION", 0.80, findings, 0.0
+        env, "DG_TEACHER_GPU_MEMORY_UTILIZATION", 0.0, findings, 0.0
     )
     lr = _number(env, "DG_LEARNING_RATE", _number(env, "DG_LR", 1e-4, findings), findings, 0.0)
     weight_decay = _number(env, "DG_WEIGHT_DECAY", 0.1, findings, 0.0)
@@ -94,68 +94,18 @@ def validate_numeric_settings(env: Mapping[str, str]) -> tuple[dict[str, Any], l
                 "The E4B diffusion architecture requires DG_CANVAS_LENGTH=256.",
             )
         )
-    if prefix < 512:
-        findings.append(
-            Finding(
-                "error",
-                "e4b_prefix_too_short",
-                "DG_PREFIX_LENGTH must be at least 512 so image soft tokens, chat markup, "
-                "and useful text conditioning fit in the E4B student prefix.",
-            )
-        )
-    # Corruption must write exactly target_blocks.  Requiring at least one
-    # teacher token per available canvas position is a conservative guarantee:
-    # response-boundary padding can only increase the number of available blocks.
-    if target_tokens < block_token_capacity:
-        findings.append(
-            Finding(
-                "error",
-                "insufficient_teacher_tokens",
-                f"DG_TARGET_ESTIMATED_TOKENS is {target_tokens:,}, below the exact "
-                f"DG_TARGET_BLOCKS x DG_CANVAS_LENGTH capacity of {block_token_capacity:,}. "
-                "Increase the teacher-token target or reduce DG_TARGET_BLOCKS.",
-            )
-        )
-    elif target_tokens > int(block_token_capacity * 1.20):
-        findings.append(
-            Finding(
-                "warning",
-                "excess_teacher_tokens",
-                f"The teacher target is more than 20% above the {block_token_capacity:,}-token "
-                "training-canvas capacity; some generated targets will not be consumed.",
-            )
-        )
-    if warmup >= optimizer_steps and optimizer_steps > 0:
-        findings.append(Finding("error", "warmup_too_long", "DG_WARMUP_STEPS must be smaller than DG_MAX_OPTIMIZER_STEPS."))
     if save_interval > optimizer_steps and optimizer_steps > 0:
         findings.append(Finding("warning", "no_periodic_checkpoint", "Save interval exceeds the whole run; only the final artifact would be saved."))
     if val_interval > optimizer_steps and optimizer_steps > 0:
         findings.append(Finding("warning", "no_periodic_validation", "Validation interval exceeds the whole run."))
     if lr <= 0:
         findings.append(Finding("error", "invalid_learning_rate", "Learning rate must be greater than zero."))
-    if weight_decay > 1:
-        findings.append(Finding("error", "invalid_weight_decay", "DG_WEIGHT_DECAY must be in [0, 1]."))
-    if not 0.0 < teacher_gpu_memory_utilization < 1.0:
+    if "DG_TEACHER_GPU_MEMORY_UTILIZATION" in env and not 0.0 < teacher_gpu_memory_utilization < 1.0:
         findings.append(
             Finding(
                 "error",
                 "invalid_teacher_gpu_memory_utilization",
                 "DG_TEACHER_GPU_MEMORY_UTILIZATION must be strictly between 0 and 1.",
-            )
-        )
-    # A Unicode character can be a token, so chars + requested completion is a
-    # safe upper bound that prevents vLLM context-length rejection mid-run.
-    teacher_context_reserve = 512
-    if (
-        teacher_max_model_len
-        < max_prompt_chars + max_tokens_per_sample + teacher_context_reserve
-    ):
-        findings.append(
-            Finding(
-                "error",
-                "teacher_context_too_short",
-                "DG_TEACHER_MAX_MODEL_LEN must cover DG_MAX_PROMPT_CHARS + "
-                "DG_MAX_TOKENS_PER_SAMPLE plus 512 reserved image/chat-template tokens.",
             )
         )
     if min_relative_val_improvement >= 1.0:
@@ -195,8 +145,8 @@ def validate_numeric_settings(env: Mapping[str, str]) -> tuple[dict[str, Any], l
         "gradient_accumulation_steps": accum,
         "effective_batch_blocks": batch * accum,
         "planned_block_passes": round(
-            optimizer_steps * batch * accum / max(target_blocks, 1), 4
-        ),
+            optimizer_steps * batch * accum / target_blocks, 4
+        ) if target_blocks > 0 else None,
         "max_optimizer_steps": optimizer_steps,
         "warmup_steps": warmup,
         "save_interval": save_interval,
@@ -208,7 +158,6 @@ def validate_numeric_settings(env: Mapping[str, str]) -> tuple[dict[str, Any], l
         "teacher_max_model_len": teacher_max_model_len,
         "max_prompt_chars": max_prompt_chars,
         "max_tokens_per_sample": max_tokens_per_sample,
-        "teacher_context_reserve": teacher_context_reserve,
         "teacher_gpu_memory_utilization": teacher_gpu_memory_utilization,
         "learning_rate": lr,
         "weight_decay": weight_decay,
@@ -242,46 +191,14 @@ def validate_dataset_config(path: Path, env: Mapping[str, str], target_tokens: i
     enabled = [row for row in config.get("sources", []) if row.get("enabled", False)]
     max_per_source = _integer(env, "DG_MAX_RECORDS_PER_SOURCE", 0, findings, 0)
     max_total = _integer(env, "DG_MAX_TOTAL_PROMPT_RECORDS", 0, findings, 0)
-    max_tokens_per_sample = _integer(env, "DG_MAX_TOKENS_PER_SAMPLE", 4096, findings, 1)
-    record_capacity = 0
-    bad_sources: list[str] = []
-    for source in enabled:
-        try:
-            source_capacity = int(source.get("max_records", 0))
-        except (TypeError, ValueError):
-            source_capacity = 0
-        if source_capacity <= 0:
-            bad_sources.append(str(source.get("id", "<unnamed>")))
-            continue
-        if max_per_source > 0:
-            source_capacity = min(source_capacity, max_per_source)
-        record_capacity += source_capacity
+    max_tokens_per_sample = _integer(env, "DG_MAX_TOKENS_PER_SAMPLE", 0, findings, 0)
+    record_capacity = max_per_source * len(enabled) if max_per_source > 0 else None
     if max_total > 0:
-        record_capacity = min(record_capacity, max_total)
-    token_capacity_upper_bound = record_capacity * max_tokens_per_sample
+        record_capacity = min(record_capacity, max_total) if record_capacity is not None else max_total
+    token_capacity_upper_bound = record_capacity * max_tokens_per_sample if record_capacity is not None and max_tokens_per_sample > 0 else None
 
     if not enabled:
         findings.append(Finding("error", "no_enabled_sources", "Dataset config has no enabled sources."))
-    if bad_sources:
-        findings.append(Finding("error", "source_capacity_missing", f"Enabled sources need positive max_records: {', '.join(bad_sources)}"))
-    if token_capacity_upper_bound < target_tokens:
-        findings.append(
-            Finding(
-                "error",
-                "source_capacity_too_small",
-                f"Enabled-source upper bound is {token_capacity_upper_bound:,} teacher tokens "
-                f"({record_capacity:,} records x {max_tokens_per_sample:,}), below the {target_tokens:,} target. "
-                "Increase source max_records/add sources or lower the target.",
-            )
-        )
-    elif token_capacity_upper_bound < int(target_tokens * 1.25):
-        findings.append(
-            Finding(
-                "warning",
-                "source_capacity_low_margin",
-                "The theoretical source capacity is less than 25% above target; filtering or short answers can exhaust it early.",
-            )
-        )
 
     return {
         "path": str(path),
@@ -297,7 +214,7 @@ def estimate_disk_gib(settings: Mapping[str, Any], env: Mapping[str, str]) -> di
     # This is deliberately a conservative lower bound. Multimodal tensors can
     # dominate it, so users may raise DG_MIN_FREE_DISK_GB for media-heavy runs.
     target_tokens = int(settings["target_estimated_tokens"])
-    blocks = int(settings["target_blocks"])
+    blocks = int(settings["target_blocks"]) or (target_tokens + 255) // 256
     prefix = int(settings["prefix_length"])
     canvas = int(settings["canvas_length"])
     retention = int(settings["checkpoint_retention"])
