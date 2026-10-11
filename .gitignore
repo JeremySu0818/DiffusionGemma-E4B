@@ -9,9 +9,5 @@ artifacts/conversion_training/
 artifacts/transplanted/
 artifacts/*.tar.gz
 artifacts/*.tar.gz.json
-data/prompt_context/
-data/teacher_supervised/
-data/media_cache/
-data/corruption/
-data/corruption_validation/
+/data/
 *.egg-info/

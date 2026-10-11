@@ -749,3 +749,81 @@ def test_build_shards_writes_exact_manifest_and_provenance(tmp_path: Path, monke
                             canvas_length=4, prefix_length=16, shard_blocks=2)
     assert complete["blocks_written"] == 4
     assert verify_shards(tmp_path / "all-blocks", canvas_length=4, expected_blocks=4)["exact"]
+
+
+@pytest.mark.parametrize("record_order", ["source", "shuffled"])
+@pytest.mark.parametrize("target_blocks", [0, 5])
+@pytest.mark.parametrize("interruption", ["mid_record", "checkpoint", "sigint"])
+def test_corruption_resume_matches_uninterrupted_data(tmp_path, monkeypatch, record_order, target_blocks, interruption):
+    import signal
+    from diffusiongemma_e4b import corruption
+
+    raw = tmp_path / "teacher.jsonl"
+    raw.write_text("\n" + "\n\n".join(json.dumps({
+        "id": f"record-{i}", "prompt_text": f"question {i}",
+        "text": "abcdef", "metadata": {"bucket": "unit"},
+    }) for i in range(6)) + "\n", encoding="utf-8")
+    monkeypatch.setattr(corruption.AutoConfig, "from_pretrained", lambda *a, **k: SimpleNamespace(_commit_hash=None))
+    monkeypatch.setattr(corruption.AutoTokenizer, "from_pretrained", lambda *a, **k: _FakeTokenizer())
+    monkeypatch.setattr(corruption.AutoProcessor, "from_pretrained", lambda *a, **k: object())
+    monkeypatch.setattr(corruption, "_CHECKPOINT_INTERVAL_SECONDS", 0)
+    options = dict(tokenizer_name_or_path="fake/student", target_blocks=target_blocks,
+                   canvas_length=4, prefix_length=16, shard_blocks=1, record_order=record_order)
+    reference = tmp_path / "reference"
+    expected = build_shards(raw, reference, **options)
+    output = tmp_path / "resumed"
+    original_encoder = corruption._encoder_inputs
+    original_atomic_json = corruption._atomic_json
+    calls = 0
+
+    def interrupt_encoder(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if interruption == "mid_record" and calls == 4:
+            raise KeyboardInterrupt
+        if interruption == "sigint" and calls == 3:
+            signal.raise_signal(signal.SIGINT)
+        return original_encoder(*args, **kwargs)
+
+    def interrupt_checkpoint(path, payload):
+        if interruption == "checkpoint" and path.name == "corruption_checkpoint.json" and payload["records_read"] == 2:
+            raise KeyboardInterrupt
+        return original_atomic_json(path, payload)
+
+    monkeypatch.setattr(corruption, "_encoder_inputs", interrupt_encoder)
+    monkeypatch.setattr(corruption, "_atomic_json", interrupt_checkpoint)
+    with pytest.raises(KeyboardInterrupt):
+        build_shards(raw, output, **options)
+    checkpoint_path = next(tmp_path.glob(".resumed.staging-*/corruption_checkpoint.json"))
+    checkpoint = json.loads(checkpoint_path.read_text())
+    assert checkpoint["records_read"] == (2 if interruption == "sigint" else 1)
+
+    monkeypatch.setattr(corruption, "_encoder_inputs", original_encoder)
+    monkeypatch.setattr(corruption, "_atomic_json", original_atomic_json)
+    if interruption == "checkpoint":
+        saved_shard = checkpoint_path.parent / checkpoint["files"][0]["name"]
+        original_bytes = saved_shard.read_bytes()
+        saved_shard.write_bytes(b"broken")
+        with pytest.raises(RuntimeError, match="checkpoint shard is missing or corrupt"):
+            build_shards(raw, output, **options)
+        saved_shard.write_bytes(original_bytes)
+    actual = build_shards(raw, output, **options)
+    for key in ("blocks_written", "records_read", "by_modality", "by_bucket", "multimodal_uncompressed_bytes", "fingerprint"):
+        assert actual[key] == expected[key]
+
+    def rows(directory, manifest):
+        result = {}
+        for entry in manifest["files"]:
+            with np.load(directory / entry["name"], allow_pickle=False) as shard:
+                for i, record_id in enumerate(shard["record_ids"]):
+                    key = (str(record_id), int(shard["chunk_index"][i]))
+                    assert key not in result
+                    result[key] = {name: shard[name][i].copy() for name in shard.files
+                                   if name not in {"canvas_length", "prefix_length"}}
+        return result
+
+    expected_rows, actual_rows = rows(reference, expected), rows(output, actual)
+    assert actual_rows.keys() == expected_rows.keys()
+    for key in expected_rows:
+        for name, value in expected_rows[key].items():
+            np.testing.assert_array_equal(actual_rows[key][name], value)

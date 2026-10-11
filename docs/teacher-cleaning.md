@@ -24,4 +24,10 @@ DG_CORRUPTION_DIR=data/corruption/large_clean \
 DG_TARGET_BLOCKS=0 bash scripts/linux/corrupt.sh
 ```
 
+全量製作先掃描 JSONL 計算總筆數，進度條顯示筆數、百分比、速度、ETA 和累計 blocks。ETA 估算資料處理階段；最後寫檔及驗證另有階段提示。
+
+Shards 現在會自動續跑，使用完全相同的命令即可。每約 60 秒在完整記錄邊界將 buffers 寫成 shards，並原子保存 `corruption_checkpoint.json`，包括已讀筆數、shard 清單、統計及隨機數狀態。首次 Ctrl+C 會等待當前記錄完成並保存後退出；再次 Ctrl+C 或強制終止，則下次從最後成功的 checkpoint 恢復，尚未保存的工作會重做。
+
+恢復前會重新確認輸入及參數指紋、已保存 shard 的大小和 SHA-256。已完成的記錄會跳過，中斷後尚未提交的 shard 會重新製作。改變資料或參數會使用另一個暫存目錄。舊版只保存 `corruption_progress.json` 的暫存無法恢復，程式會保留在 `.legacy-*` 目錄並重新開始。
+
 清理命令不修改 progress 或 resume 索引。若之後再續跑 teacher，替換原檔造成的檔案 identity 變更會讓既有 resume 索引從 JSONL 重新建構，已刪除的 prompt 可以重新生成。

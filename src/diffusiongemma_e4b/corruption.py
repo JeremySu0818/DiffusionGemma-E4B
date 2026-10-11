@@ -4,8 +4,10 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -15,7 +17,6 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from .constants import CANVAS_LENGTH, DEFAULT_DIFFUSION_REFERENCE, DEFAULT_PREFIX_LENGTH
-from .data_contract import iter_jsonl
 
 
 MULTIMODAL_SHARD_KEYS = (
@@ -26,6 +27,7 @@ MULTIMODAL_SHARD_KEYS = (
     "mm_token_type_ids",
 )
 MANIFEST_NAME = "corruption_manifest.json"
+_CHECKPOINT_INTERVAL_SECONDS = 60
 
 
 def _noise_block(
@@ -344,15 +346,22 @@ def _jsonl_offsets(path: Path) -> list[int]:
     return offsets
 
 
-def iter_jsonl_records(path: Path, record_order: str, seed: int) -> Iterable[dict[str, Any]]:
+def iter_jsonl_records(path: Path, record_order: str, seed: int, start_record: int = 0) -> Iterable[dict[str, Any]]:
     if record_order == "source":
-        yield from iter_jsonl(path)
+        with path.open("rb") as source:
+            index = 0
+            for line in source:
+                if not line.strip():
+                    continue
+                if index >= start_record:
+                    yield json.loads(line)
+                index += 1
         return
     offsets = _jsonl_offsets(path)
     rng = np.random.default_rng(seed)
     rng.shuffle(offsets)
     with path.open("rb") as f:
-        for offset in offsets:
+        for offset in offsets[start_record:]:
             f.seek(offset)
             yield json.loads(f.readline().decode("utf-8"))
 
@@ -363,6 +372,20 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _scan_jsonl(path: Path) -> tuple[str, int]:
+    """Count nonempty records while hashing the input, without parsing JSON."""
+    digest = hashlib.sha256()
+    records = 0
+    with path.open("rb") as source, tqdm(
+        total=path.stat().st_size, desc="count records", unit="B", unit_scale=True,
+    ) as progress:
+        for line in source:
+            digest.update(line)
+            records += bool(line.strip())
+            progress.update(len(line))
+    return digest.hexdigest(), records
 
 
 def _build_fingerprint(raw_sha256: str, **kwargs: Any) -> str:
@@ -420,7 +443,11 @@ def build_shards(
         trust_remote_code=True,
         revision=tokenizer_revision or None,
     )
-    raw_sha256 = _sha256_file(raw_jsonl)
+    total_records = None
+    if target_blocks == 0:
+        raw_sha256, total_records = _scan_jsonl(raw_jsonl)
+    else:
+        raw_sha256 = _sha256_file(raw_jsonl)
     dataset_config_sha256 = (
         _sha256_file(dataset_config)
         if dataset_config is not None and dataset_config.is_file()
@@ -473,9 +500,12 @@ def build_shards(
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = output_dir.parent / f".{output_dir.name}.staging-{fingerprint[:16]}"
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
+    checkpoint_path = staging / "corruption_checkpoint.json"
+    if staging.exists() and not checkpoint_path.is_file():
+        legacy = staging.with_name(f"{staging.name}.legacy-{time.time_ns()}")
+        os.replace(staging, legacy)
+        tqdm.write(f"Old staging has no resumable checkpoint; preserved at {legacy}. Starting anew.")
+    staging.mkdir(parents=True, exist_ok=True)
     progress_path = staging / "corruption_progress.json"
 
     try:
@@ -498,7 +528,36 @@ def build_shards(
     multimodal_bytes = 0
     by_modality: dict[str, int] = {}
     by_bucket: dict[str, int] = {}
-    pbar = tqdm(total=target_blocks or None, desc="corrupt", unit="block")
+    if checkpoint_path.is_file():
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if checkpoint.get("schema_version") != 1 or checkpoint.get("fingerprint") != fingerprint:
+            raise RuntimeError("incompatible corruption checkpoint; use a new output directory")
+        files = checkpoint["files"]
+        for entry in files:
+            path = staging / entry["name"]
+            if not path.is_file() or path.stat().st_size != entry["bytes"] or _sha256_file(path) != entry["sha256"]:
+                raise RuntimeError(f"checkpoint shard is missing or corrupt: {path}")
+        committed = {entry["name"] for entry in files}
+        # A crash can leave shards written after the last atomic checkpoint.
+        for path in staging.glob("corruption_*.npz"):
+            if path.name not in committed:
+                path.unlink()
+        blocks_written = checkpoint["blocks_written"]
+        records_read = checkpoint["records_read"]
+        multimodal_bytes = checkpoint["multimodal_uncompressed_bytes"]
+        shard_ids = checkpoint["shard_families"]
+        by_modality = checkpoint["by_modality"]
+        by_bucket = checkpoint["by_bucket"]
+        rng.bit_generator.state = checkpoint["rng_state"]
+        tqdm.write(f"Resuming from {records_read:,} records / {blocks_written:,} blocks.")
+    record_progress = target_blocks == 0
+    pbar = tqdm(
+        total=total_records if record_progress else target_blocks,
+        desc="corrupt", unit="record" if record_progress else "block",
+        initial=records_read if record_progress else blocks_written,
+    )
+    if record_progress:
+        pbar.set_postfix(blocks=blocks_written, refresh=False)
 
     def write_progress() -> None:
         _atomic_json(
@@ -506,6 +565,7 @@ def build_shards(
             {
                 "fingerprint": fingerprint,
                 "records_read": records_read,
+                "total_records": total_records,
                 "blocks_written": blocks_written,
                 "target_blocks": target_blocks,
                 "multimodal_uncompressed_bytes": multimodal_bytes,
@@ -534,8 +594,42 @@ def build_shards(
         buffer_bytes[sig] = 0
         write_progress()
 
+    def save_checkpoint() -> None:
+        # Commit only at record boundaries, with all buffers durable first.
+        # If interrupted during flush/commit, the previous checkpoint still wins.
+        for sig in list(buffers):
+            flush(sig)
+        _atomic_json(checkpoint_path, {
+            "schema_version": 1,
+            "fingerprint": fingerprint,
+            "records_read": records_read,
+            "blocks_written": blocks_written,
+            "multimodal_uncompressed_bytes": multimodal_bytes,
+            "shard_families": shard_ids,
+            "files": files,
+            "by_modality": by_modality,
+            "by_bucket": by_bucket,
+            "rng_state": rng.bit_generator.state,
+        })
+        write_progress()
+
+    if not checkpoint_path.is_file():
+        save_checkpoint()
+    last_checkpoint = time.monotonic()
+    stop_requested = False
+
+    def request_stop(signum, frame) -> None:
+        nonlocal stop_requested
+        if stop_requested:
+            raise KeyboardInterrupt
+        stop_requested = True
+        tqdm.write("Stopping after the current record and saving a checkpoint; Ctrl+C again stops immediately.")
+
+    previous_sigint = None
+    if threading.current_thread() is threading.main_thread():
+        previous_sigint = signal.signal(signal.SIGINT, request_stop)
     try:
-        for record in iter_jsonl_records(raw_jsonl, record_order=record_order, seed=seed):
+        for record in iter_jsonl_records(raw_jsonl, record_order=record_order, seed=seed, start_record=records_read):
             if target_blocks > 0 and blocks_written >= target_blocks:
                 break
             records_read += 1
@@ -551,6 +645,13 @@ def build_shards(
             target_ids = _target_token_ids(tokenizer, str(record.get("text") or ""),
                                            finish_reason=metadata.get("teacher_finish_reason"))
             if not target_ids:
+                if record_progress:
+                    pbar.update(1)
+                if stop_requested or time.monotonic() - last_checkpoint >= _CHECKPOINT_INTERVAL_SECONDS:
+                    save_checkpoint()
+                    last_checkpoint = time.monotonic()
+                if stop_requested:
+                    raise KeyboardInterrupt
                 continue
             prior_ids: list[int] = []
             for chunk_index, start in enumerate(range(0, len(target_ids), canvas_length)):
@@ -590,15 +691,28 @@ def build_shards(
                 blocks_written += 1
                 by_modality[modality] = by_modality.get(modality, 0) + 1
                 by_bucket[bucket] = by_bucket.get(bucket, 0) + 1
-                pbar.update(1)
+                if not record_progress:
+                    pbar.update(1)
                 prior_ids.extend(chunk)
+            if record_progress:
+                pbar.set_postfix(blocks=blocks_written, refresh=False)
+                pbar.update(1)
+            if stop_requested or time.monotonic() - last_checkpoint >= _CHECKPOINT_INTERVAL_SECONDS:
+                save_checkpoint()
+                last_checkpoint = time.monotonic()
+            if stop_requested:
+                raise KeyboardInterrupt
 
-        for sig in list(buffers):
-            flush(sig)
+        pbar.set_description("corrupt (flush)")
+        save_checkpoint()
+        if stop_requested:
+            raise KeyboardInterrupt
     except BaseException:
-        write_progress()
+        tqdm.write("Interrupted; rerun the same command to resume from the last saved checkpoint.")
         raise
     finally:
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
         pbar.close()
 
     if target_blocks > 0 and blocks_written != target_blocks:
@@ -606,6 +720,7 @@ def build_shards(
             f"corruption dataset underfilled: wrote exactly {blocks_written} blocks, required {target_blocks}; "
             "generate more valid teacher tokens before training"
         )
+    tqdm.write("Verifying completed shards...")
     verify_shards(staging, min_blocks=target_blocks, canvas_length=canvas_length, expected_blocks=blocks_written)
     manifest: dict[str, Any] = {
         "schema_version": 3,
