@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing
 import os
 import signal
 import shutil
 import tempfile
 import threading
 import time
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -401,6 +404,79 @@ def _example_bytes(example: dict[str, Any]) -> int:
     return sum(int(value.nbytes) for value in example.values() if isinstance(value, np.ndarray))
 
 
+def _cpu_workers() -> int:
+    return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+
+
+_PREPROCESS_MODELS = None
+_PREPROCESS_CANCEL = None
+
+
+def _init_preprocessor(source, revision, inherited_models, cancellation):
+    global _PREPROCESS_MODELS, _PREPROCESS_CANCEL
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _PREPROCESS_CANCEL = cancellation
+    if inherited_models is not None:
+        _PREPROCESS_MODELS = inherited_models
+        return
+    import torch
+    torch.set_num_threads(int(os.environ.get("DG_CORRUPTION_NATIVE_THREADS", "1")))
+    tokenizer = AutoTokenizer.from_pretrained(source, trust_remote_code=True, revision=revision or None)
+    try:
+        processor = AutoProcessor.from_pretrained(source, trust_remote_code=True, revision=revision or None)
+    except (OSError, ValueError):
+        processor = None
+    _PREPROCESS_MODELS = tokenizer, processor
+
+
+def _prepare_worker(task):
+    record, prefix_length, canvas_length, max_blocks = task
+    tokenizer, processor = _PREPROCESS_MODELS
+    return _prepare_record(record, processor, tokenizer, prefix_length, canvas_length, max_blocks, _PREPROCESS_CANCEL)
+
+
+def _prepare_record(record, processor, tokenizer, prefix_length, canvas_length, max_blocks=0, cancel_event=None):
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    ids = _target_token_ids(tokenizer, str(record.get("text") or ""),
+                            finish_reason=metadata.get("teacher_finish_reason"))
+    prepared = []
+    prior_ids = []
+    for start in range(0, len(ids), canvas_length):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        if max_blocks > 0 and len(prepared) >= max_blocks:
+            break
+        chunk = ids[start:start + canvas_length]
+        try:
+            encoder = _encoder_inputs(processor, tokenizer, record, prefix_length, prior_ids=prior_ids)
+        except Exception as exc:
+            raise RuntimeError(f"failed to process encoder/media inputs for record {record.get('id')}") from exc
+        prepared.append((chunk, encoder))
+        prior_ids.extend(chunk)
+    return record, prepared
+
+
+def _ordered_prepare(records, prepare, executor, prefetch):
+    """Bound outstanding results and consume in input order for deterministic RNG."""
+    pending = deque()
+    records = iter(records)
+    exhausted = object()
+    try:
+        for _ in range(prefetch):
+            record = next(records, exhausted)
+            if record is exhausted:
+                break
+            pending.append(executor.submit(prepare, record))
+        while pending:
+            yield pending.popleft().result()
+            record = next(records, exhausted)
+            if record is not exhausted:
+                pending.append(executor.submit(prepare, record))
+    finally:
+        for future in pending:
+            future.cancel()
+
+
 def _publish_staging(staging: Path, output_dir: Path, fingerprint: str) -> Path | None:
     backup: Path | None = None
     if output_dir.exists():
@@ -429,7 +505,13 @@ def build_shards(
     max_shard_uncompressed_bytes: int = 2 * 1024**3,
     dataset_config: Path | None = None,
     source_names: set[str] | None = None,
+    num_workers: int = 1,
+    prefetch_records: int = 0,
 ) -> dict[str, Any]:
+    if num_workers < 0 or prefetch_records < 0:
+        raise ValueError("num_workers and prefetch_records must be nonnegative")
+    num_workers = num_workers or _cpu_workers()
+    prefetch_records = prefetch_records or num_workers
     if not raw_jsonl.is_file():
         raise FileNotFoundError(raw_jsonl)
     tokenizer_config = AutoConfig.from_pretrained(
@@ -495,7 +577,8 @@ def build_shards(
     if existing_manifest.is_file():
         existing = json.loads(existing_manifest.read_text(encoding="utf-8"))
         if existing.get("fingerprint") == fingerprint:
-            verify_shards(output_dir, min_blocks=target_blocks, canvas_length=canvas_length, expected_blocks=existing["blocks_written"])
+            verify_shards(output_dir, min_blocks=target_blocks, canvas_length=canvas_length,
+                          expected_blocks=existing["blocks_written"], num_workers=num_workers)
             return existing
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -558,6 +641,29 @@ def build_shards(
     )
     if record_progress:
         pbar.set_postfix(blocks=blocks_written, refresh=False)
+    executor = ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="shard-write") if num_workers > 1 else None
+    pending_writes = deque()
+    cancel_preparation = threading.Event()
+    preprocess_executor = None
+    if num_workers > 1:
+        import torch
+        torch.set_num_threads(int(os.environ.get("DG_CORRUPTION_NATIVE_THREADS", "1")))
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        use_fork = "fork" in multiprocessing.get_all_start_methods()
+        context = multiprocessing.get_context("fork" if use_fork else "spawn")
+        cancel_preparation = context.Event()
+        preprocess_executor = ProcessPoolExecutor(
+            max_workers=num_workers, mp_context=context, initializer=_init_preprocessor,
+            initargs=(tokenizer_name_or_path, tokenizer_revision,
+                      (tokenizer, processor) if use_fork else None, cancel_preparation),
+        )
+    tqdm.write(f"Shard CPU workers: {num_workers}; prefetch records: {prefetch_records}.")
+
+    def prepare(record):
+        if cancel_preparation.is_set():
+            return record, []
+        return _prepare_record(record, processor, tokenizer, prefix_length, canvas_length,
+                               target_blocks, cancel_preparation)
 
     def write_progress() -> None:
         _atomic_json(
@@ -579,19 +685,19 @@ def build_shards(
             return
         family = _signature_name(sig)
         shard_id = shard_ids.get(family, 0)
-        path = _write_shard(staging, family, shard_id, examples, canvas_length, prefix_length, pad_token_id)
         shard_ids[family] = shard_id + 1
-        files.append(
-            {
-                "name": path.name,
-                "family": family,
-                "rows": len(examples),
-                "bytes": path.stat().st_size,
-                "sha256": _sha256_file(path),
-            }
-        )
         buffers[sig] = []
         buffer_bytes[sig] = 0
+        def write():
+            path = _write_shard(staging, family, shard_id, examples, canvas_length, prefix_length, pad_token_id)
+            return {"name": path.name, "family": family, "rows": len(examples),
+                    "bytes": path.stat().st_size, "sha256": _sha256_file(path)}
+        if executor is None:
+            files.append(write())
+        else:
+            pending_writes.append(executor.submit(write))
+            if len(pending_writes) >= num_workers:
+                files.append(pending_writes.popleft().result())
         write_progress()
 
     def save_checkpoint() -> None:
@@ -599,6 +705,8 @@ def build_shards(
         # If interrupted during flush/commit, the previous checkpoint still wins.
         for sig in list(buffers):
             flush(sig)
+        while pending_writes:
+            files.append(pending_writes.popleft().result())
         _atomic_json(checkpoint_path, {
             "schema_version": 1,
             "fingerprint": fingerprint,
@@ -628,8 +736,14 @@ def build_shards(
     previous_sigint = None
     if threading.current_thread() is threading.main_thread():
         previous_sigint = signal.signal(signal.SIGINT, request_stop)
+    prepared_records = None
     try:
-        for record in iter_jsonl_records(raw_jsonl, record_order=record_order, seed=seed, start_record=records_read):
+        records = (() if target_blocks > 0 and blocks_written >= target_blocks else
+                   iter_jsonl_records(raw_jsonl, record_order=record_order, seed=seed, start_record=records_read))
+        tasks = ((record, prefix_length, canvas_length, target_blocks) for record in records)
+        prepared_records = (_ordered_prepare(tasks, _prepare_worker, preprocess_executor, prefetch_records)
+                            if preprocess_executor is not None else map(prepare, records))
+        for record, prepared in prepared_records:
             if target_blocks > 0 and blocks_written >= target_blocks:
                 break
             records_read += 1
@@ -642,9 +756,7 @@ def build_shards(
             )
             bucket = str(metadata.get("bucket") or "unknown")
             modality = str(record.get("modality") or "text")
-            target_ids = _target_token_ids(tokenizer, str(record.get("text") or ""),
-                                           finish_reason=metadata.get("teacher_finish_reason"))
-            if not target_ids:
+            if not prepared:
                 if record_progress:
                     pbar.update(1)
                 if stop_requested or time.monotonic() - last_checkpoint >= _CHECKPOINT_INTERVAL_SECONDS:
@@ -653,15 +765,9 @@ def build_shards(
                 if stop_requested:
                     raise KeyboardInterrupt
                 continue
-            prior_ids: list[int] = []
-            for chunk_index, start in enumerate(range(0, len(target_ids), canvas_length)):
+            for chunk_index, (chunk, encoder) in enumerate(prepared):
                 if target_blocks > 0 and blocks_written >= target_blocks:
                     break
-                chunk = target_ids[start : start + canvas_length]
-                try:
-                    encoder = _encoder_inputs(processor, tokenizer, record, prefix_length, prior_ids=prior_ids)
-                except Exception as exc:  # noqa: BLE001
-                    raise RuntimeError(f"failed to process encoder/media inputs for record {record_id}") from exc
                 target = np.full((canvas_length,), -100, dtype=np.int64)
                 target[: len(chunk)] = np.asarray(chunk, dtype=np.int64)
                 corrupted, mask, t = _noise_block(target, vocab_size, pad_token_id, rng)
@@ -693,7 +799,6 @@ def build_shards(
                 by_bucket[bucket] = by_bucket.get(bucket, 0) + 1
                 if not record_progress:
                     pbar.update(1)
-                prior_ids.extend(chunk)
             if record_progress:
                 pbar.set_postfix(blocks=blocks_written, refresh=False)
                 pbar.update(1)
@@ -702,6 +807,8 @@ def build_shards(
                 last_checkpoint = time.monotonic()
             if stop_requested:
                 raise KeyboardInterrupt
+            if target_blocks > 0 and blocks_written >= target_blocks:
+                break
 
         pbar.set_description("corrupt (flush)")
         save_checkpoint()
@@ -711,6 +818,13 @@ def build_shards(
         tqdm.write("Interrupted; rerun the same command to resume from the last saved checkpoint.")
         raise
     finally:
+        cancel_preparation.set()
+        if prepared_records is not None and hasattr(prepared_records, "close"):
+            prepared_records.close()
+        if preprocess_executor is not None:
+            preprocess_executor.shutdown(wait=True, cancel_futures=True)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
         if previous_sigint is not None:
             signal.signal(signal.SIGINT, previous_sigint)
         pbar.close()
@@ -721,7 +835,8 @@ def build_shards(
             "generate more valid teacher tokens before training"
         )
     tqdm.write("Verifying completed shards...")
-    verify_shards(staging, min_blocks=target_blocks, canvas_length=canvas_length, expected_blocks=blocks_written)
+    verify_shards(staging, min_blocks=target_blocks, canvas_length=canvas_length,
+                  expected_blocks=blocks_written, num_workers=num_workers)
     manifest: dict[str, Any] = {
         "schema_version": 3,
         "fingerprint": fingerprint,
@@ -757,6 +872,7 @@ def build_shards(
             min_blocks=target_blocks,
             canvas_length=canvas_length,
             expected_blocks=blocks_written,
+            num_workers=num_workers,
         )
     except BaseException:
         failed = output_dir.parent / f".{output_dir.name}.failed-{fingerprint[:12]}"
@@ -776,7 +892,11 @@ def verify_shards(
     min_blocks: int = 1,
     canvas_length: int = CANVAS_LENGTH,
     expected_blocks: int | None = None,
+    num_workers: int = 1,
 ) -> dict[str, Any]:
+    if num_workers < 0:
+        raise ValueError("num_workers must be nonnegative")
+    num_workers = num_workers or _cpu_workers()
     manifest_path = output_dir / MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else None
     if manifest is not None:
@@ -785,12 +905,13 @@ def verify_shards(
         files = sorted(output_dir.glob("corruption_*.npz"))
     if not files:
         raise ValueError(f"no corruption shards found in {output_dir}")
-    total = 0
-    for path in files:
+    entries = {item["name"]: item for item in manifest["files"]} if manifest is not None else {}
+
+    def verify_file(path):
         if not path.is_file():
             raise ValueError(f"manifest shard is missing: {path}")
         if manifest is not None:
-            entry = next(item for item in manifest["files"] if item["name"] == path.name)
+            entry = entries[path.name]
             if int(entry.get("bytes", -1)) != path.stat().st_size:
                 raise ValueError(f"{path} size does not match manifest")
             if entry.get("sha256") != _sha256_file(path):
@@ -811,11 +932,12 @@ def verify_shards(
             missing = required - set(shard.files)
             if manifest is not None and missing:
                 raise ValueError(f"{path} missing required arrays: {sorted(missing)}")
-            if shard["target_ids"].shape[1] != canvas_length:
+            target_shape = shard["target_ids"].shape
+            if target_shape[1] != canvas_length:
                 raise ValueError(f"{path} has wrong canvas length")
-            if shard["corrupted_ids"].shape != shard["target_ids"].shape:
+            if shard["corrupted_ids"].shape != target_shape:
                 raise ValueError(f"{path} corrupted/target shape mismatch")
-            rows = shard["target_ids"].shape[0]
+            rows = target_shape[0]
             for key in ("corruption_masks", "noise_t", "prefix_ids"):
                 if shard[key].shape[0] != rows:
                     raise ValueError(f"{path} {key} row count mismatch")
@@ -823,7 +945,12 @@ def verify_shards(
                 raise ValueError(f"{path} pixel_values row count mismatch")
             if "input_features" in shard and shard["input_features"].shape[0] != rows:
                 raise ValueError(f"{path} input_features row count mismatch")
-            total += rows
+            return rows
+    if num_workers > 1:
+        with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="shard-verify") as pool:
+            total = sum(tqdm(pool.map(verify_file, files), total=len(files), desc="verify", unit="shard"))
+    else:
+        total = sum(map(verify_file, files))
     if total < min_blocks:
         raise ValueError(f"only {total} blocks found; need at least {min_blocks}")
     if expected_blocks is not None and total != expected_blocks:
@@ -849,15 +976,24 @@ def main() -> None:
     parser.add_argument("--max-shard-uncompressed-bytes", type=int, default=2 * 1024**3)
     parser.add_argument("--dataset-config", type=Path, default=None)
     parser.add_argument("--sources", default="")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="CPU workers for preprocessing, compression and verification; 0 uses all available CPUs, 1 is serial.")
+    parser.add_argument("--prefetch-records", type=int, default=0,
+                        help="Maximum queued preprocessing records; 0 uses the worker count. Lower to reduce RAM use.")
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
+
+    if not args.verify_only and args.num_workers != 1:
+        import torch
+        torch.set_num_threads(int(os.environ.get("DG_CORRUPTION_NATIVE_THREADS", "1")))
 
     if args.verify_only:
         result = verify_shards(
             args.output_dir,
             min_blocks=args.target_blocks,
             canvas_length=args.canvas_length,
-            expected_blocks=args.target_blocks,
+            expected_blocks=args.target_blocks or None,
+            num_workers=args.num_workers,
         )
     else:
         result = build_shards(
@@ -874,6 +1010,8 @@ def main() -> None:
             args.max_shard_uncompressed_bytes,
             args.dataset_config,
             {item.strip() for item in args.sources.split(",") if item.strip()} or None,
+            num_workers=args.num_workers,
+            prefetch_records=args.prefetch_records,
         )
     print(json.dumps(result, indent=2))
 

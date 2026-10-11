@@ -26,6 +26,19 @@ DG_TARGET_BLOCKS=0 bash scripts/linux/corrupt.sh
 
 全量製作先掃描 JSONL 計算總筆數，進度條顯示筆數、百分比、速度、ETA 和累計 blocks。ETA 估算資料處理階段；最後寫檔及驗證另有階段提示。
 
+Linux/Windows 腳本預設使用全部可用 CPU：多程序執行 tokenizer 與媒體預處理，多執行緒壓縮、寫入及驗證 shards。Linux worker 繼承載入好的 tokenizer/processor，避免逐 worker 複製大型詞表。主程序依輸入順序收取結果並產生 corruption，保持隨機數與續跑一致。預取及尚未完成的寫檔數量都有界限。
+
+`DG_CORRUPTION_WORKERS=0` 自動選擇可用 CPU 數，`1` 改為串行，正值指定 worker 數；CLI 對應 `--num-workers`。`DG_CORRUPTION_PREFETCH=0` 預設預取同 worker 數的記錄，正值指定數量；CLI 對應 `--prefetch-records`。降低預取數可以降低處理中媒體佔用的 RAM。worker 數與預取數不影響資料指紋，可在續跑時調整。
+
+```bash
+DG_CORRUPTION_WORKERS=0 \
+DG_TEACHER_OUTPUT=data/teacher_supervised/large/teacher_outputs.jsonl \
+DG_CORRUPTION_DIR=data/corruption-large \
+DG_TARGET_BLOCKS=0 bash scripts/linux/corrupt.sh
+```
+
+腳本預設把每個 worker 內的 OpenMP/MKL/OpenBLAS threads 設為 1，避免多層並行互相搶 CPU。計數、輸入 SHA-256 與最終發布仍由主程序處理；磁碟 I/O、記憶體頻寬及記錄大小也會影響 CPU 利用率。
+
 Shards 現在會自動續跑，使用完全相同的命令即可。每約 60 秒在完整記錄邊界將 buffers 寫成 shards，並原子保存 `corruption_checkpoint.json`，包括已讀筆數、shard 清單、統計及隨機數狀態。首次 Ctrl+C 會等待當前記錄完成並保存後退出；再次 Ctrl+C 或強制終止，則下次從最後成功的 checkpoint 恢復，尚未保存的工作會重做。
 
 恢復前會重新確認輸入及參數指紋、已保存 shard 的大小和 SHA-256。已完成的記錄會跳過，中斷後尚未提交的 shard 會重新製作。改變資料或參數會使用另一個暫存目錄。舊版只保存 `corruption_progress.json` 的暫存無法恢復，程式會保留在 `.legacy-*` 目錄並重新開始。

@@ -775,11 +775,12 @@ def test_corruption_resume_matches_uninterrupted_data(tmp_path, monkeypatch, rec
     original_encoder = corruption._encoder_inputs
     original_atomic_json = corruption._atomic_json
     calls = 0
+    second_record_id = list(iter_jsonl_records(raw, record_order, seed=1337))[1]["id"]
 
     def interrupt_encoder(*args, **kwargs):
         nonlocal calls
         calls += 1
-        if interruption == "mid_record" and calls == 4:
+        if interruption == "mid_record" and args[2]["id"] == second_record_id and kwargs["prior_ids"]:
             raise KeyboardInterrupt
         if interruption == "sigint" and calls == 3:
             signal.raise_signal(signal.SIGINT)
@@ -793,7 +794,7 @@ def test_corruption_resume_matches_uninterrupted_data(tmp_path, monkeypatch, rec
     monkeypatch.setattr(corruption, "_encoder_inputs", interrupt_encoder)
     monkeypatch.setattr(corruption, "_atomic_json", interrupt_checkpoint)
     with pytest.raises(KeyboardInterrupt):
-        build_shards(raw, output, **options)
+        build_shards(raw, output, **options, num_workers=3 if interruption == "mid_record" else 1)
     checkpoint_path = next(tmp_path.glob(".resumed.staging-*/corruption_checkpoint.json"))
     checkpoint = json.loads(checkpoint_path.read_text())
     assert checkpoint["records_read"] == (2 if interruption == "sigint" else 1)
@@ -807,7 +808,7 @@ def test_corruption_resume_matches_uninterrupted_data(tmp_path, monkeypatch, rec
         with pytest.raises(RuntimeError, match="checkpoint shard is missing or corrupt"):
             build_shards(raw, output, **options)
         saved_shard.write_bytes(original_bytes)
-    actual = build_shards(raw, output, **options)
+    actual = build_shards(raw, output, **options, num_workers=3, prefetch_records=2)
     for key in ("blocks_written", "records_read", "by_modality", "by_bucket", "multimodal_uncompressed_bytes", "fingerprint"):
         assert actual[key] == expected[key]
 
