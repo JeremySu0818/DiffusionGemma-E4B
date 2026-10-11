@@ -92,6 +92,22 @@ def _stable_group_value(value: Any) -> str:
     return str(value)
 
 
+def sample_token_noise(target, vocab_size, pad_token_id, rng, noise_min=0.05, noise_max=0.95):
+    valid = target >= 0
+    if not valid.any():
+        raise ValueError("target has no valid tokens")
+    if vocab_size <= 0:
+        raise ValueError(f"invalid vocab size: {vocab_size}")
+    noise_t = float(rng.uniform(noise_min, noise_max))
+    mask = (rng.random(target.shape, dtype=np.float32) < noise_t) & valid
+    if not mask.any():
+        mask[int(rng.choice(np.flatnonzero(valid)))] = True
+    corrupted = np.full(target.shape, pad_token_id, dtype=np.int64)
+    corrupted[valid] = target[valid]
+    corrupted[mask] = rng.integers(0, vocab_size, size=int(mask.sum()), dtype=np.int64)
+    return corrupted, mask.astype(np.bool_), noise_t
+
+
 class CorruptionShardDataset(Dataset):
     """Read shards, split source records, and re-sample uniform-state noise."""
 
@@ -102,7 +118,6 @@ class CorruptionShardDataset(Dataset):
         val_fraction: float = 0.01,
         seed: int = 1337,
         *,
-        online_corruption: bool = True,
         vocab_size: int | None = None,
         pad_token_id: int = 0,
         noise_min: float = 0.05,
@@ -120,7 +135,6 @@ class CorruptionShardDataset(Dataset):
             raise FileNotFoundError(f"no corruption_*.npz files in {data_dir}")
         self.seed = int(seed)
         self.epoch = 0
-        self.online_corruption = bool(online_corruption)
         self.vocab_size = vocab_size
         self.pad_token_id = int(pad_token_id)
         self.noise_min = float(noise_min)
@@ -130,6 +144,8 @@ class CorruptionShardDataset(Dataset):
         found_record_ids = False
         for path in self.files:
             with np.load(path, allow_pickle=False) as shard:
+                if {"corrupted_ids", "corruption_masks", "noise_t"}.intersection(shard.files):
+                    raise ValueError(f"{path} contains offline noise; regenerate clean-only shards")
                 target_ids = shard["target_ids"]
                 n = int(target_ids.shape[0])
                 record_key = next((key for key in RECORD_ID_KEYS if key in shard), None)
@@ -228,35 +244,26 @@ class CorruptionShardDataset(Dataset):
         target: np.ndarray,
         path: Path,
         row: int,
-        fallback_corrupted: np.ndarray,
+        shard_vocab_size: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         valid = target >= 0
         if not valid.any():
             raise ValueError(f"{path} row {row} has no target tokens")
-        rng = self._row_rng(path, row)
-        noise_t = float(rng.uniform(self.noise_min, self.noise_max))
-        corruption_mask = (rng.random(target.shape, dtype=np.float32) < noise_t) & valid
-        if not corruption_mask.any():
-            corruption_mask[int(rng.choice(np.flatnonzero(valid)))] = True
         if self.vocab_size is None:
-            vocab_size = max(int(target[valid].max()), int(fallback_corrupted.max()), 0) + 1
+            if shard_vocab_size is not None:
+                vocab_size = shard_vocab_size
+            else:
+                raise ValueError(f"{path}: clean shards require vocab_size metadata or an explicit tokenizer vocab_size")
         else:
             vocab_size = int(self.vocab_size)
-        if vocab_size <= 0:
-            raise ValueError(f"invalid vocab size: {vocab_size}")
-        corrupted = np.full(target.shape, self.pad_token_id, dtype=np.int64)
-        corrupted[valid] = target[valid]
-        corrupted[corruption_mask] = rng.integers(
-            0, vocab_size, size=int(corruption_mask.sum()), dtype=np.int64
-        )
-        return corrupted, corruption_mask.astype(np.bool_), noise_t
+        return sample_token_noise(target, vocab_size, self.pad_token_id, self._row_rng(path, row),
+                                  self.noise_min, self.noise_max)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         path, row = self.index[idx]
         shard = self._open(path)
         prefix = shard["prefix_ids"][row].astype(np.int64)
         target = shard["target_ids"][row].astype(np.int64)
-        stored_corrupted = shard["corrupted_ids"][row].astype(np.int64)
         attention_mask_key = next(
             (key for key in ("attention_mask", "attention_masks") if key in shard),
             None,
@@ -268,21 +275,8 @@ class CorruptionShardDataset(Dataset):
             attention_mask = np.zeros_like(prefix, dtype=np.int64)
             if prefix_len:
                 attention_mask[-prefix_len:] = 1
-        if self.online_corruption:
-            corrupted, corruption_mask, noise_t = self._online_noise(
-                target, path, row, stored_corrupted
-            )
-        else:
-            corrupted = stored_corrupted
-            if "corruption_masks" in shard:
-                corruption_mask = shard["corruption_masks"][row].astype(np.bool_)
-            else:
-                corruption_mask = (corrupted != target) & (target >= 0)
-            noise_t = (
-                float(shard["noise_t"][row])
-                if "noise_t" in shard
-                else float(corruption_mask[target >= 0].mean())
-            )
+        shard_vocab_size = int(shard["vocab_size"].item()) if "vocab_size" in shard else None
+        corrupted, corruption_mask, noise_t = self._online_noise(target, path, row, shard_vocab_size)
         return {
             **self._optional_multimodal_tensors(shard, row),
             "input_ids": torch.from_numpy(prefix),
@@ -921,7 +915,7 @@ def _training_fingerprint(args, warmup_steps: int) -> str:
         "val_interval": args.val_interval,
         "val_batches": args.val_batches,
         "min_relative_val_improvement": args.min_relative_val_improvement,
-        "online_corruption": not args.offline_corruption,
+        "noise_policy": "online_only",
         "noise_min": args.noise_min,
         "noise_max": args.noise_max,
         "clean_token_loss_weight": args.clean_token_loss_weight,
@@ -1150,7 +1144,6 @@ def train(args) -> dict:
         "data_dir": args.data_dir,
         "val_fraction": args.val_fraction,
         "seed": args.seed,
-        "online_corruption": not args.offline_corruption,
         "vocab_size": vocab_size,
         "pad_token_id": pad_token_id,
         "noise_min": args.noise_min,
@@ -1451,7 +1444,6 @@ def main() -> None:
     parser.add_argument("--clean-token-loss-weight", type=float, default=0.0)
     parser.add_argument("--noise-min", type=float, default=0.05)
     parser.add_argument("--noise-max", type=float, default=0.95)
-    parser.add_argument("--offline-corruption", action="store_true")
     parser.add_argument("--lora-r", type=int, default=64)
     parser.add_argument("--lora-alpha", type=int, default=128)
     parser.add_argument("--lora-dropout", type=float, default=0.05)

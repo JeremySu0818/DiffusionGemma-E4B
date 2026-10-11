@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
-import math
 import platform
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,7 @@ import transformers
 
 from .constants import CANVAS_LENGTH
 from .infer import MULTIMODAL_BATCH_KEYS, _model_input_device, load_model_and_processor
-from .train import corruption_data_fingerprint
+from .train import corruption_data_fingerprint, sample_token_noise
 
 
 def _package_versions() -> dict[str, str | None]:
@@ -128,34 +127,25 @@ def validate_shards(data_dir: Path, expected_canvas_length: int = CANVAS_LENGTH)
         raise FileNotFoundError(f"no corruption_*.npz files in {data_dir}")
 
     total_rows = 0
-    corrupted_tokens = 0
     valid_tokens = 0
     record_ids: set[str] = set()
     families: dict[str, int] = {}
     buckets: dict[str, int] = {}
-    noise_min = math.inf
-    noise_max = -math.inf
     for path in files:
         with np.load(path, allow_pickle=False) as shard:
-            required = {"prefix_ids", "prefix_lens", "target_ids", "corrupted_ids", "corruption_masks", "noise_t"}
+            if {"corrupted_ids", "corruption_masks", "noise_t"}.intersection(shard.files):
+                raise ValueError(f"{path} contains offline noise; regenerate clean-only shards")
+            required = {"prefix_ids", "prefix_lens", "target_ids", "vocab_size", "pad_token_id"}
             missing = sorted(required.difference(shard.files))
             if missing:
                 raise ValueError(f"{path} is missing arrays: {missing}")
             target = shard["target_ids"]
-            corrupted = shard["corrupted_ids"]
-            corruption_mask = shard["corruption_masks"].astype(bool)
             if target.ndim != 2 or target.shape[1] != expected_canvas_length:
                 raise ValueError(f"{path} target shape {target.shape} does not match canvas {expected_canvas_length}")
-            if corrupted.shape != target.shape or corruption_mask.shape != target.shape:
-                raise ValueError(f"{path} target/corrupted/mask shapes differ")
             rows = int(target.shape[0])
             if shard["prefix_ids"].shape[0] != rows or shard["prefix_lens"].shape[0] != rows:
                 raise ValueError(f"{path} prefix row count differs from targets")
             valid = target != -100
-            if bool((corruption_mask & ~valid).any()):
-                raise ValueError(f"{path} corrupts padding/ignored target positions")
-            if bool((corruption_mask.sum(axis=1) == 0).any()):
-                raise ValueError(f"{path} contains a row with zero denoising targets")
             if bool((valid.sum(axis=1) == 0).any()):
                 raise ValueError(f"{path} contains an empty target row")
             for key in ("attention_mask", "attention_masks", *MULTIMODAL_BATCH_KEYS):
@@ -167,14 +157,11 @@ def validate_shards(data_dir: Path, expected_canvas_length: int = CANVAS_LENGTH)
                 for value in shard["buckets"].tolist():
                     bucket = str(value)
                     buckets[bucket] = buckets.get(bucket, 0) + 1
-            noise = shard["noise_t"].astype(np.float32)
-            if bool(((noise <= 0.0) | (noise >= 1.0)).any()):
-                raise ValueError(f"{path} contains noise_t outside (0, 1)")
-            noise_min = min(noise_min, float(noise.min()))
-            noise_max = max(noise_max, float(noise.max()))
+            vocab_size = int(shard["vocab_size"].item())
+            if vocab_size <= 0 or bool((target[valid] >= vocab_size).any()):
+                raise ValueError(f"{path} target tokens exceed vocab_size")
             total_rows += rows
             valid_tokens += int(valid.sum())
-            corrupted_tokens += int(corruption_mask.sum())
             family = path.stem.split("_")[1] if "_" in path.stem else "unknown"
             families[family] = families.get(family, 0) + rows
 
@@ -182,12 +169,9 @@ def validate_shards(data_dir: Path, expected_canvas_length: int = CANVAS_LENGTH)
         "files": len(files),
         "blocks": total_rows,
         "valid_tokens": valid_tokens,
-        "corrupted_tokens": corrupted_tokens,
-        "corrupted_fraction": corrupted_tokens / max(valid_tokens, 1),
+        "noise_policy": "online_only",
         "unique_record_ids": len(record_ids) if record_ids else None,
         "record_level_split_supported": bool(record_ids),
-        "noise_t_min": noise_min,
-        "noise_t_max": noise_max,
         "families": families,
         "buckets": buckets,
         "bucket_block_shares": {
@@ -214,13 +198,18 @@ def _first_batch(data_dir: Path) -> dict[str, torch.Tensor]:
             if prefix_len:
                 prefix_mask[:, -prefix_len:] = 1
         target = torch.from_numpy(shard["target_ids"][:1].astype(np.int64))
+        corrupted_row, mask_row, _ = sample_token_noise(
+            target[0].numpy(), int(shard["vocab_size"].item()), int(shard["pad_token_id"].item()),
+            np.random.default_rng(1337),
+        )
+        corrupted, corruption_mask = corrupted_row[None], mask_row[None]
         batch: dict[str, torch.Tensor] = {
             "input_ids": prefix,
             "attention_mask": prefix_mask,
-            "decoder_input_ids": torch.from_numpy(shard["corrupted_ids"][:1].astype(np.int64)),
+            "decoder_input_ids": torch.from_numpy(corrupted),
             "decoder_attention_mask": torch.cat([prefix_mask, target.ne(-100).long()], dim=1),
             "labels": target,
-            "corruption_mask": torch.from_numpy(shard["corruption_masks"][:1].astype(bool)),
+            "corruption_mask": torch.from_numpy(corruption_mask),
         }
         for key in MULTIMODAL_BATCH_KEYS:
             if key not in shard:

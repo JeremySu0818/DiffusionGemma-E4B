@@ -749,6 +749,37 @@ def test_build_shards_writes_exact_manifest_and_provenance(tmp_path: Path, monke
                             canvas_length=4, prefix_length=16, shard_blocks=2)
     assert complete["blocks_written"] == 4
     assert verify_shards(tmp_path / "all-blocks", canvas_length=4, expected_blocks=4)["exact"]
+    assert complete["schema_version"] == 4
+    assert complete["noise_policy"] == "online_only"
+    for entry in complete["files"]:
+        with np.load(tmp_path / "all-blocks" / entry["name"], allow_pickle=False) as shard:
+            assert not {"corrupted_ids", "corruption_masks", "noise_t"}.intersection(shard.files)
+
+    from diffusiongemma_e4b.train import CorruptionShardDataset
+    from diffusiongemma_e4b.validate import _first_batch, validate_shards
+    data_dir = tmp_path / "all-blocks"
+    ds = CorruptionShardDataset(data_dir, split="train", val_fraction=0.5)
+    first, repeated = ds[0], ds[0]
+    np.testing.assert_array_equal(first["decoder_input_ids"], repeated["decoder_input_ids"])
+    ds.set_epoch(1)
+    changed = ds[0]
+    assert not np.array_equal(first["decoder_input_ids"], changed["decoder_input_ids"])
+    np.testing.assert_array_equal(first["labels"], changed["labels"])
+    assert first["corruption_mask"].any()
+    assert not (first["corruption_mask"] & first["labels"].eq(-100)).any()
+    assert validate_shards(data_dir, expected_canvas_length=4)["noise_policy"] == "online_only"
+    forward_batch = _first_batch(data_dir)
+    assert forward_batch["corruption_mask"].any()
+    assert not (forward_batch["corruption_mask"] & forward_batch["labels"].eq(-100)).any()
+    old_dir = tmp_path / "old-noise"
+    old_dir.mkdir()
+    with np.load(data_dir / complete["files"][0]["name"], allow_pickle=False) as shard:
+        arrays = {key: shard[key] for key in shard.files}
+    arrays["corrupted_ids"] = arrays["target_ids"].copy()
+    np.savez_compressed(old_dir / "corruption_text_000000.npz", **arrays)
+    for reader in (CorruptionShardDataset, verify_shards, validate_shards):
+        with pytest.raises(ValueError, match="contains offline noise"):
+            reader(old_dir)
 
 
 @pytest.mark.parametrize("record_order", ["source", "shuffled"])

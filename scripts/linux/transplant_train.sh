@@ -61,9 +61,6 @@ train_args=(
   --seed "${DG_SEED:-1337}"
 )
 
-if [[ "${DG_OFFLINE_CORRUPTION:-0}" == "1" ]]; then
-  train_args+=(--offline-corruption)
-fi
 if [[ "${DG_GRADIENT_CHECKPOINTING:-0}" == "1" ]]; then
   train_args+=(--gradient-checkpointing)
 fi

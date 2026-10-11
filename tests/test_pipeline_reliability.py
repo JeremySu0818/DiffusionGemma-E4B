@@ -76,9 +76,8 @@ def test_record_split_is_stratified_by_bucket(tmp_path: Path) -> None:
         prefix_ids=np.ones((rows, 2), dtype=np.int64),
         prefix_lens=np.full(rows, 2, dtype=np.int64),
         target_ids=np.ones((rows, 2), dtype=np.int64),
-        corrupted_ids=np.ones((rows, 2), dtype=np.int64),
-        corruption_masks=np.ones((rows, 2), dtype=np.bool_),
-        noise_t=np.full(rows, 0.5, dtype=np.float32),
+        vocab_size=np.array([128], dtype=np.int64),
+        pad_token_id=np.array([0], dtype=np.int64),
         record_ids=record_ids,
         buckets=buckets,
     )

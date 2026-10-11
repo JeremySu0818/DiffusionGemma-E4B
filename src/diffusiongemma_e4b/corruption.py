@@ -33,24 +33,6 @@ MANIFEST_NAME = "corruption_manifest.json"
 _CHECKPOINT_INTERVAL_SECONDS = 60
 
 
-def _noise_block(
-    target: np.ndarray,
-    vocab_size: int,
-    pad_token_id: int,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    t = float(rng.uniform(0.05, 0.95))
-    label_mask = target >= 0
-    mask = (rng.random(target.shape, dtype=np.float32) < t) & label_mask
-    if label_mask.any() and not mask.any():
-        valid = np.flatnonzero(label_mask)
-        mask[int(rng.choice(valid))] = True
-    corrupted = np.full(target.shape, pad_token_id, dtype=np.int64)
-    corrupted[label_mask] = target[label_mask]
-    corrupted[mask] = rng.integers(0, vocab_size, size=int(mask.sum()), dtype=np.int64)
-    return corrupted, mask.astype(np.bool_), t
-
-
 def _prefix_text(record: dict[str, Any]) -> str:
     prompt = str(record.get("prompt_text") or record.get("prompt") or "").strip()
     context = str(record.get("context_text") or record.get("context") or "").strip()
@@ -294,7 +276,10 @@ def _write_shard(
     canvas_length: int,
     prefix_length: int,
     pad_token_id: int = 0,
+    vocab_size: int | None = None,
 ) -> Path:
+    if vocab_size is None or vocab_size <= 0:
+        raise ValueError("clean shards require the tokenizer vocab_size")
     width = max(len(ex["prefix_ids"]) for ex in examples)
 
     def padded(key: str, value: int) -> np.ndarray:
@@ -308,9 +293,6 @@ def _write_shard(
         "attention_mask": padded("attention_mask", 0).astype(np.int64),
         "prefix_lens": np.asarray([int(ex["prefix_lens"]) for ex in examples], dtype=np.int64),
         "target_ids": np.stack([ex["target_ids"] for ex in examples]).astype(np.int64),
-        "corrupted_ids": np.stack([ex["corrupted_ids"] for ex in examples]).astype(np.int64),
-        "corruption_masks": np.stack([ex["corruption_masks"] for ex in examples]).astype(np.bool_),
-        "noise_t": np.asarray([float(ex["noise_t"]) for ex in examples], dtype=np.float32),
         "record_ids": np.asarray([str(ex["record_id"]) for ex in examples], dtype=np.str_),
         "source_ids": np.asarray([str(ex["source_id"]) for ex in examples], dtype=np.str_),
         "buckets": np.asarray([str(ex["bucket"]) for ex in examples], dtype=np.str_),
@@ -318,7 +300,9 @@ def _write_shard(
         "modality": np.asarray([str(ex["modality"]) for ex in examples], dtype=np.str_),
         "canvas_length": np.array([canvas_length], dtype=np.uint16),
         "prefix_length": np.array([width], dtype=np.int64),
+        "pad_token_id": np.array([pad_token_id], dtype=np.int64),
     }
+    arrays["vocab_size"] = np.array([vocab_size], dtype=np.int64)
     for key in MULTIMODAL_SHARD_KEYS:
         if key in examples[0]:
             arrays[key] = padded(key, 0) if key == "mm_token_type_ids" else np.stack([ex[key] for ex in examples])
@@ -392,7 +376,7 @@ def _scan_jsonl(path: Path) -> tuple[str, int]:
 
 
 def _build_fingerprint(raw_sha256: str, **kwargs: Any) -> str:
-    payload = {"schema": 3, "raw_jsonl_sha256": raw_sha256, **kwargs}
+    payload = {"schema": 4, "raw_jsonl_sha256": raw_sha256, **kwargs}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -599,7 +583,6 @@ def build_shards(
         )
     except (OSError, ValueError):
         processor = None
-    rng = np.random.default_rng(seed)
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     vocab_size = len(tokenizer) if hasattr(tokenizer, "__len__") else tokenizer.vocab_size
     buffers: dict[tuple[tuple[str, tuple[int, ...], str], ...], list[dict[str, Any]]] = {}
@@ -613,7 +596,7 @@ def build_shards(
     by_bucket: dict[str, int] = {}
     if checkpoint_path.is_file():
         checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-        if checkpoint.get("schema_version") != 1 or checkpoint.get("fingerprint") != fingerprint:
+        if checkpoint.get("schema_version") != 2 or checkpoint.get("fingerprint") != fingerprint:
             raise RuntimeError("incompatible corruption checkpoint; use a new output directory")
         files = checkpoint["files"]
         for entry in files:
@@ -631,7 +614,6 @@ def build_shards(
         shard_ids = checkpoint["shard_families"]
         by_modality = checkpoint["by_modality"]
         by_bucket = checkpoint["by_bucket"]
-        rng.bit_generator.state = checkpoint["rng_state"]
         tqdm.write(f"Resuming from {records_read:,} records / {blocks_written:,} blocks.")
     record_progress = target_blocks == 0
     pbar = tqdm(
@@ -689,7 +671,8 @@ def build_shards(
         buffers[sig] = []
         buffer_bytes[sig] = 0
         def write():
-            path = _write_shard(staging, family, shard_id, examples, canvas_length, prefix_length, pad_token_id)
+            path = _write_shard(staging, family, shard_id, examples, canvas_length, prefix_length,
+                                pad_token_id, vocab_size=vocab_size)
             return {"name": path.name, "family": family, "rows": len(examples),
                     "bytes": path.stat().st_size, "sha256": _sha256_file(path)}
         if executor is None:
@@ -708,7 +691,7 @@ def build_shards(
         while pending_writes:
             files.append(pending_writes.popleft().result())
         _atomic_json(checkpoint_path, {
-            "schema_version": 1,
+            "schema_version": 2,
             "fingerprint": fingerprint,
             "records_read": records_read,
             "blocks_written": blocks_written,
@@ -717,7 +700,6 @@ def build_shards(
             "files": files,
             "by_modality": by_modality,
             "by_bucket": by_bucket,
-            "rng_state": rng.bit_generator.state,
         })
         write_progress()
 
@@ -770,13 +752,9 @@ def build_shards(
                     break
                 target = np.full((canvas_length,), -100, dtype=np.int64)
                 target[: len(chunk)] = np.asarray(chunk, dtype=np.int64)
-                corrupted, mask, t = _noise_block(target, vocab_size, pad_token_id, rng)
                 example: dict[str, Any] = {
                     **encoder,
                     "target_ids": target,
-                    "corrupted_ids": corrupted,
-                    "corruption_masks": mask,
-                    "noise_t": np.asarray(t, dtype=np.float32),
                     "record_id": record_id,
                     "source_id": source_id,
                     "bucket": bucket,
@@ -838,7 +816,10 @@ def build_shards(
     verify_shards(staging, min_blocks=target_blocks, canvas_length=canvas_length,
                   expected_blocks=blocks_written, num_workers=num_workers)
     manifest: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "noise_policy": "online_only",
+        "vocab_size": vocab_size,
+        "pad_token_id": pad_token_id,
         "fingerprint": fingerprint,
         "raw_jsonl": str(raw_jsonl),
         "raw_jsonl_sha256": raw_sha256,
@@ -917,17 +898,18 @@ def verify_shards(
             if entry.get("sha256") != _sha256_file(path):
                 raise ValueError(f"{path} sha256 does not match manifest")
         with np.load(path, allow_pickle=False) as shard:
+            if {"corrupted_ids", "corruption_masks", "noise_t"}.intersection(shard.files):
+                raise ValueError(f"{path} contains offline noise; regenerate clean-only shards")
             required = {
                 "prefix_ids",
                 "target_ids",
-                "corrupted_ids",
-                "corruption_masks",
-                "noise_t",
                 "record_ids",
                 "source_ids",
                 "buckets",
                 "chunk_index",
                 "modality",
+                "vocab_size",
+                "pad_token_id",
             }
             missing = required - set(shard.files)
             if manifest is not None and missing:
@@ -935,10 +917,10 @@ def verify_shards(
             target_shape = shard["target_ids"].shape
             if target_shape[1] != canvas_length:
                 raise ValueError(f"{path} has wrong canvas length")
-            if shard["corrupted_ids"].shape != target_shape:
-                raise ValueError(f"{path} corrupted/target shape mismatch")
             rows = target_shape[0]
-            for key in ("corruption_masks", "noise_t", "prefix_ids"):
+            for key in ("prefix_ids",):
+                if key not in shard:
+                    continue
                 if shard[key].shape[0] != rows:
                     raise ValueError(f"{path} {key} row count mismatch")
             if "pixel_values" in shard and shard["pixel_values"].shape[0] != rows:

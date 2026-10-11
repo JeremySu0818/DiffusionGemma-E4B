@@ -75,9 +75,8 @@ def test_corruption_dataset_reads_multimodal_npz_fields(tmp_path):
         prefix_ids=np.ones((2, 8), dtype=np.int64),
         prefix_lens=np.array([8, 8], dtype=np.int64),
         target_ids=np.ones((2, 4), dtype=np.int64),
-        corrupted_ids=np.ones((2, 4), dtype=np.int64),
-        corruption_masks=np.ones((2, 4), dtype=np.bool_),
-        noise_t=np.array([0.1, 0.2], dtype=np.float32),
+        vocab_size=np.array([128], dtype=np.int64),
+        pad_token_id=np.array([0], dtype=np.int64),
         record_ids=np.array(["record-0", "record-1"]),
         buckets=np.array(
             ["teacher_supervised_image", "teacher_supervised_image"]
@@ -122,13 +121,10 @@ def test_multimodal_shard_keeps_full_inputs_and_aligns_padding(tmp_path, monkeyp
         examples.append({
             **encoder,
             "target_ids": np.ones(4, dtype=np.int64),
-            "corrupted_ids": np.ones(4, dtype=np.int64),
-            "corruption_masks": np.ones(4, dtype=bool),
-            "noise_t": 0.5,
             "record_id": f"r{width}", "source_id": "images", "bucket": "images",
             "chunk_index": 0, "modality": "image",
         })
-    path = _write_shard(tmp_path, "image", 0, examples, 4, 16, pad_token_id=7)
+    path = _write_shard(tmp_path, "image", 0, examples, 4, 16, pad_token_id=7, vocab_size=256)
     with np.load(path, allow_pickle=False) as shard:
         assert shard["prefix_lens"].tolist() == [100, 120]
         for row, width in enumerate((100, 120)):
